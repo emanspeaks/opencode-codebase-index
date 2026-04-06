@@ -56,7 +56,6 @@ pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>
         _ => return Ok(vec![]),
     };
 
-    // Limit query analysis to prevent tree-sitter internal bugs
     let query = Query::new(&ts_language, query_source)
         .map_err(|e| anyhow!("Failed to compile query: {}", e))?;
 
@@ -157,47 +156,17 @@ pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>
             }
         }
 
-        // Safely detect method calls using query context analysis
-        // For PHP: check if the call is wrapped in a method call pattern
-        if let (Some(name), Some(CallType::Call), Some(pos)) = (&callee_name, call_type, position) {
-            let is_method_call = match language {
-                Language::TypeScript
-                | Language::TypeScriptTsx
-                | Language::JavaScript
-                | Language::JavaScriptJsx => match_.captures.iter().any(|c| {
-                    callee_name_idx.map(|idx| c.index == idx).unwrap_or(false)
-                        && (c.node.kind() == "property_identifier" || c.node.kind() == "identifier")
-                }),
-                Language::Python => match_.captures.iter().any(|c| {
-                    callee_name_idx.map(|idx| c.index == idx).unwrap_or(false)
-                        && c.node.kind() == "identifier"
-                }),
-                Language::Rust => match_.captures.iter().any(|c| {
-                    callee_name_idx.map(|idx| c.index == idx).unwrap_or(false)
-                        && c.node.kind() == "field_identifier"
-                }),
-                Language::Go => match_.captures.iter().any(|c| {
-                    callee_name_idx.map(|idx| c.index == idx).unwrap_or(false)
-                        && c.node.kind() == "field_identifier"
-                }),
-                Language::Php => {
-                    // PHP method calls are already marked in query (@method.call, @static.call)
-                    // @call is only for direct function calls
-                    // So if we reach here with CallType::Call, it's definitely not a method call
-                    false
-                }
-                _ => false,
-            };
-
-            let final_call_type = if is_method_call {
-                CallType::MethodCall
-            } else {
-                CallType::Call
-            };
-
+        // PHP method calls are already marked in query (@method.call, @static.call)
+        // @call is only for direct function calls
+        // So we need to check if the call was already classified as a method call
+        if let (Some(name), Some(ct), Some(pos)) = (callee_name, call_type, position) {
             // PHP function/method names are case-insensitive; normalize to lowercase
             // so that HELPER() matches symbol helper during resolution and lookup.
-            let normalized_name = if language == Language::Php {
+            // Import names and constructor names should keep their original case for proper symbol resolution
+            let normalized_name = if language == Language::Php
+                && ct != CallType::Import
+                && ct != CallType::Constructor
+            {
                 name.to_lowercase()
             } else {
                 name.clone()
@@ -205,13 +174,6 @@ pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>
 
             calls.push(CallSite {
                 callee_name: normalized_name,
-                line: pos.0,
-                column: pos.1,
-                call_type: final_call_type,
-            });
-        } else if let (Some(name), Some(ct), Some(pos)) = (callee_name, call_type, position) {
-            calls.push(CallSite {
-                callee_name: name,
                 line: pos.0,
                 column: pos.1,
                 call_type: ct,

@@ -497,7 +497,7 @@ fn extract_name(cursor: &tree_sitter::TreeCursor, source: &str) -> Option<String
     };
 
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i.try_into().unwrap()) {
             if let Some(name) = extract_identifier(child) {
                 #[cfg(debug_assertions)]
                 {
@@ -511,7 +511,7 @@ fn extract_name(cursor: &tree_sitter::TreeCursor, source: &str) -> Option<String
 
     if node.kind() == "export_statement" {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+            if let Some(child) = node.child(i.try_into().unwrap()) {
                 let child_kind = child.kind();
                 if matches!(
                     child_kind,
@@ -524,7 +524,7 @@ fn extract_name(cursor: &tree_sitter::TreeCursor, source: &str) -> Option<String
                         | "abstract_class_declaration"
                 ) {
                     for j in 0..child.child_count() {
-                        if let Some(grandchild) = child.child(j) {
+                        if let Some(grandchild) = child.child(j.try_into().unwrap()) {
                             if let Some(name) = extract_identifier(grandchild) {
                                 #[cfg(debug_assertions)]
                                 {
@@ -538,10 +538,12 @@ fn extract_name(cursor: &tree_sitter::TreeCursor, source: &str) -> Option<String
 
                     if child_kind == "lexical_declaration" {
                         for j in 0..child.child_count() {
-                            if let Some(declarator) = child.child(j) {
+                            if let Some(declarator) = child.child(j.try_into().unwrap()) {
                                 if declarator.kind() == "variable_declarator" {
                                     for k in 0..declarator.child_count() {
-                                        if let Some(name_node) = declarator.child(k) {
+                                        if let Some(name_node) =
+                                            declarator.child(k.try_into().unwrap())
+                                        {
                                             if name_node.kind() == "identifier" {
                                                 #[cfg(debug_assertions)]
                                                 {
