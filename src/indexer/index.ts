@@ -930,6 +930,28 @@ function diversifyRerankedHead<T extends {
   });
 }
 
+function diversifyCandidatesByFile(candidates: RankedCandidate[], enabled: boolean): RankedCandidate[] {
+  if (!enabled || candidates.length <= 2) {
+    return candidates;
+  }
+
+  const seenFiles = new Set<string>();
+  const primary: RankedCandidate[] = [];
+  const remainder: RankedCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const filePath = candidate.metadata.filePath;
+    if (!seenFiles.has(filePath)) {
+      seenFiles.add(filePath);
+      primary.push(candidate);
+    } else {
+      remainder.push(candidate);
+    }
+  }
+
+  return [...primary, ...remainder];
+}
+
 export function rankHybridResults(
   query: string,
   semanticResults: RankedCandidate[],
@@ -1594,7 +1616,7 @@ export class Indexer {
         }
 
         const order = new Map(rankedIds.map((id, index) => [id, index]));
-        rerankedHead.push(...[...bandCandidates].sort((a, b) => {
+        const bandReranked = [...bandCandidates].sort((a, b) => {
           const aRank = order.get(a.id) ?? Number.MAX_SAFE_INTEGER;
           const bRank = order.get(b.id) ?? Number.MAX_SAFE_INTEGER;
           if (aRank !== bRank) {
@@ -1604,7 +1626,9 @@ export class Indexer {
             return b.score - a.score;
           }
           return a.id.localeCompare(b.id);
-        }));
+        });
+        const shouldDiversifyBand = !options?.hasIdentifierHints;
+        rerankedHead.push(...diversifyCandidatesByFile(bandReranked, shouldDiversifyBand));
       }
 
       this.logger.search("debug", "Applied external reranker", {
