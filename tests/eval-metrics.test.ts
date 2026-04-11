@@ -161,12 +161,13 @@ describe("eval metrics", () => {
     expect(metrics.hitAt3).toBe(1);
     expect(metrics.mrrAt10).toBeCloseTo(0.75, 5);
     expect(metrics.distinctTop3Ratio).toBe(1);
+    expect(metrics.rawDistinctTop3Ratio).toBe(1);
     expect(metrics.latencyMs.p50).toBeGreaterThan(0);
     expect(metrics.embedding.callCount).toBe(20);
     expect(metrics.embedding.estimatedCostUsd).toBeCloseTo(0.00002, 8);
   });
 
-  it("tracks distinctTop3Ratio on per-query eval output", () => {
+  it("tracks deduped and raw distinctTop3 ratios separately", () => {
     const queries: GoldenQuery[] = [query({ id: "q-dup" })];
     const perQuery = [
       buildPerQueryResult(
@@ -204,6 +205,8 @@ describe("eval metrics", () => {
 
     const metrics = computeEvalMetrics(queries, perQuery, 0, 0, 0);
     expect(metrics.distinctTop3Ratio).toBe(1);
+    expect(metrics.rawDistinctTop3Ratio).toBeCloseTo(2 / 3, 6);
+    expect(perQuery[0].rawTop3DistinctRatio).toBeCloseTo(2 / 3, 6);
   });
 
   it("uses deterministic percentile behavior for tiny samples", () => {
