@@ -458,4 +458,59 @@ describe("retrieval ranking", () => {
     expect(reranked.map((candidate) => candidate.id)).toEqual(["first", "second", "third"]);
     globalThis.fetch = fetchSpy;
   });
+
+  it("skips external reranker for definition-intent queries with identifier hints", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embed",
+        dimensions: 8,
+      },
+      reranker: {
+        enabled: true,
+        provider: "custom",
+        model: "mock-reranker",
+        baseUrl: "https://rerank.example/v1",
+        topN: 3,
+      },
+    });
+    const indexer = new Indexer("/repo", config);
+
+    const fetchSpy = globalThis.fetch;
+    let rerankCalled = false;
+    globalThis.fetch = (async (input) => {
+      if (String(input).includes("/rerank")) {
+        rerankCalled = true;
+        return new Response(JSON.stringify({
+          results: [
+            { index: 2, relevance_score: 0.99 },
+            { index: 0, relevance_score: 0.72 },
+            { index: 1, relevance_score: 0.4 },
+          ],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 8 }, () => 0.1) }], usage: { total_tokens: 1 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const candidates: Candidate[] = [
+      { id: "first", score: 0.9, metadata: meta({ filePath: "/repo/src/first.ts", name: "rankHybridResults", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "second", score: 0.89, metadata: meta({ filePath: "/repo/src/second.ts", name: "otherThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "third", score: 0.88, metadata: meta({ filePath: "/repo/README.md", name: "docs", chunkType: "other", startLine: 1, endLine: 3 }) },
+    ];
+
+    const reranked = await (indexer as unknown as {
+      rerankCandidatesWithApi(
+        query: string,
+        items: Candidate[],
+        options?: { definitionIntent?: boolean; hasIdentifierHints?: boolean }
+      ): Promise<Candidate[]>;
+    }).rerankCandidatesWithApi("where is rankHybridResults implementation", candidates, {
+      hasIdentifierHints: true,
+    });
+
+    expect(rerankCalled).toBe(false);
+    expect(reranked.map((candidate) => candidate.id)).toEqual(["first", "second", "third"]);
+    globalThis.fetch = fetchSpy;
+  });
 });

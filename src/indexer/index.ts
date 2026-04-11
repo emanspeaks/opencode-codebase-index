@@ -1493,10 +1493,18 @@ export class Indexer {
 
   private async rerankCandidatesWithApi(
     query: string,
-    candidates: RankedCandidate[]
+    candidates: RankedCandidate[],
+    options?: {
+      definitionIntent?: boolean;
+      hasIdentifierHints?: boolean;
+    }
   ): Promise<RankedCandidate[]> {
     const reranker = this.config.reranker;
     if (!reranker || !reranker.enabled || candidates.length <= 1) {
+      return candidates;
+    }
+
+    if (options?.definitionIntent === true || options?.hasIdentifierHints === true) {
       return candidates;
     }
 
@@ -2620,6 +2628,7 @@ export class Indexer {
     const rerankTopN = this.config.search.rerankTopN;
     const filterByBranch = options?.filterByBranch ?? true;
     const sourceIntent = options?.definitionIntent === true || classifyQueryIntentRaw(query) === "source";
+    const identifierHints = extractIdentifierHints(query);
 
     this.logger.search("debug", "Starting search", {
       query,
@@ -2693,7 +2702,10 @@ export class Indexer {
       hybridWeight,
       prioritizeSourcePaths: sourceIntent,
     });
-    const rerankedCombined = await this.rerankCandidatesWithApi(query, combined);
+    const rerankedCombined = await this.rerankCandidatesWithApi(query, combined, {
+      definitionIntent: options?.definitionIntent === true,
+      hasIdentifierHints: identifierHints.length > 0,
+    });
     const fusionMs = performance.now() - fusionStartTime;
 
     const rescued = promoteIdentifierMatches(
@@ -2734,7 +2746,7 @@ export class Indexer {
     const prePrimaryLane = mergeTieredResults(deterministicIdentifierLane, identifierLane, maxResults * 4);
     const primaryLane = mergeTieredResults(prePrimaryLane, symbolLane, maxResults * 4);
     const tiered = mergeTieredResults(primaryLane, rescued, maxResults * 4);
-    const hasCodeHints = extractCodeTermHints(query).length > 0 || extractIdentifierHints(query).length > 0;
+    const hasCodeHints = extractCodeTermHints(query).length > 0 || identifierHints.length > 0;
 
     const baseFiltered = tiered.filter((r) => {
       if (r.score < this.config.search.minScore) return false;
