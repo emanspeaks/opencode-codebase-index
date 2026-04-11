@@ -112,9 +112,9 @@ fn extract_semantic_nodes(
     let start = Instant::now();
     #[cfg(debug_assertions)]
     {
-        PERF_STATS.lock().unwrap().extract_semantic_nodes_calls += 1;
-        PERF_STATS.lock().unwrap().max_depth_reached =
-            PERF_STATS.lock().unwrap().max_depth_reached.max(depth);
+        let mut stats = PERF_STATS.lock().unwrap();
+        stats.extract_semantic_nodes_calls += 1;
+        stats.max_depth_reached = stats.max_depth_reached.max(depth);
     }
 
     const MAX_RECURSION_DEPTH: usize = 1024;
