@@ -4,7 +4,7 @@ import { performance } from "perf_hooks";
 import PQueue from "p-queue";
 import pRetry from "p-retry";
 
-import { ParsedCodebaseIndexConfig } from "../config/schema.js";
+import { ParsedCodebaseIndexConfig, type RerankerConfig } from "../config/schema.js";
 import { detectEmbeddingProvider, ConfiguredProviderInfo, tryDetectProvider, createCustomProviderInfo } from "../embeddings/detector.js";
 import {
   createEmbeddingProvider,
@@ -157,6 +157,13 @@ interface FailedBatch {
 }
 
 type RankedCandidate = { id: string; score: number; metadata: ChunkMetadata };
+
+interface RerankDocumentPayload {
+  id: string;
+  text: string;
+}
+
+type ExternalRerankBand = "implementation" | "documentation" | "test" | "other";
 
 interface HybridRankOptions {
   fusionStrategy: "weighted" | "rrf";
@@ -381,6 +388,42 @@ function isLikelyImplementationPath(filePath: string): boolean {
   }
 
   return true;
+}
+
+function isDocumentationPath(filePath: string): boolean {
+  const lowered = filePath.toLowerCase();
+  const ext = lowered.split(".").pop() ?? "";
+  return lowered.includes("readme") || ["md", "mdx", "rst", "adoc", "txt"].includes(ext);
+}
+
+function classifyExternalRerankBand(
+  candidate: RankedCandidate,
+  preferSourcePaths: boolean,
+  docIntent: boolean
+): ExternalRerankBand {
+  const isDocOrTest = isTestOrDocPath(candidate.metadata.filePath);
+  const isDocumentation = isDocumentationPath(candidate.metadata.filePath);
+  const isImplementation = isLikelyImplementationPath(candidate.metadata.filePath) &&
+    isImplementationChunkType(candidate.metadata.chunkType);
+
+  if (preferSourcePaths) {
+    if (isImplementation) return "implementation";
+    if (isDocumentation) return "documentation";
+    if (isDocOrTest) return "test";
+    return "other";
+  }
+
+  if (docIntent) {
+    if (isDocumentation) return "documentation";
+    if (isImplementation) return "implementation";
+    if (isDocOrTest) return "test";
+    return "other";
+  }
+
+  if (isImplementation) return "implementation";
+  if (isDocumentation) return "documentation";
+  if (isDocOrTest) return "test";
+  return "other";
 }
 
 function classifyQueryIntent(tokens: string[]): "source" | "doc_test" {
@@ -844,8 +887,94 @@ export function rerankResults(
     });
   }
 
+  const shouldDiversify = !(preferSourcePaths && identifierHints.length > 0);
+  const diversifiedHead = diversifyEntriesByFileAndSymbol(head, (entry) => entry.candidate, shouldDiversify);
+
   const tail = candidates.slice(topN);
-  return [...head.map((entry) => entry.candidate), ...tail];
+  return [...diversifiedHead.map((entry) => entry.candidate), ...tail];
+}
+
+function diversifyEntriesByFileAndSymbol<T>(
+  entries: T[],
+  getCandidate: (entry: T) => RankedCandidate,
+  enabled: boolean
+): T[] {
+  if (!enabled || entries.length <= 2) {
+    return entries;
+  }
+
+  const groups = new Map<string, T[]>();
+  const groupOrder: string[] = [];
+
+  for (const entry of entries) {
+    const candidate = getCandidate(entry);
+    const filePath = candidate.metadata.filePath;
+    if (!groups.has(filePath)) {
+      groups.set(filePath, []);
+      groupOrder.push(filePath);
+    }
+    groups.get(filePath)?.push(entry);
+  }
+
+  const diversifiedGroups = groupOrder.map((filePath) => {
+    const group = groups.get(filePath) ?? [];
+    return diversifyGroupBySymbol(group, getCandidate);
+  });
+
+  const result: T[] = [];
+  let added = true;
+  let round = 0;
+  while (added) {
+    added = false;
+    for (const group of diversifiedGroups) {
+      const entry = group[round];
+      if (entry !== undefined) {
+        result.push(entry);
+        added = true;
+      }
+    }
+    round += 1;
+  }
+
+  return result;
+}
+
+function diversifyCandidatesByFile(candidates: RankedCandidate[], enabled: boolean): RankedCandidate[] {
+  return diversifyEntriesByFileAndSymbol(candidates, (candidate) => candidate, enabled);
+}
+
+function diversifyGroupBySymbol<T>(
+  entries: T[],
+  getCandidate: (entry: T) => RankedCandidate
+): T[] {
+  if (entries.length <= 2) {
+    return entries;
+  }
+
+  const seenKeys = new Set<string>();
+  const primary: T[] = [];
+  const remainder: T[] = [];
+
+  for (const entry of entries) {
+    const key = buildDiversityKey(getCandidate(entry).metadata);
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      primary.push(entry);
+    } else {
+      remainder.push(entry);
+    }
+  }
+
+  return [...primary, ...remainder];
+}
+
+function buildDiversityKey(metadata: ChunkMetadata): string {
+  const normalizedPath = metadata.filePath.toLowerCase();
+  const normalizedName = (metadata.name ?? "").trim().toLowerCase();
+  if (normalizedName.length > 0) {
+    return `${normalizedPath}#${normalizedName}`;
+  }
+  return normalizedPath;
 }
 
 export function rankHybridResults(
@@ -1446,6 +1575,193 @@ export class Indexer {
       default:
         return { concurrency: 3, intervalMs: 1000, minRetryMs: 1000, maxRetryMs: 30000 };
     }
+  }
+
+  private async rerankCandidatesWithApi(
+    query: string,
+    candidates: RankedCandidate[],
+    options?: {
+      definitionIntent?: boolean;
+      hasIdentifierHints?: boolean;
+    }
+  ): Promise<RankedCandidate[]> {
+    const reranker = this.config.reranker;
+    if (!reranker || !reranker.enabled || candidates.length <= 1) {
+      return candidates;
+    }
+
+    const queryTokens = Array.from(tokenizeTextForRanking(query));
+    const preferSourcePaths = classifyQueryIntentRaw(query) === "source";
+    const docIntent = classifyDocIntent(queryTokens) === "docs";
+
+    if (options?.definitionIntent === true) {
+      return candidates;
+    }
+
+    if (options?.hasIdentifierHints === true && preferSourcePaths && !docIntent) {
+      return candidates;
+    }
+
+    const topN = Math.min(reranker.topN, candidates.length);
+    const head = candidates.slice(0, topN);
+    const tail = candidates.slice(topN);
+    const grouped = new Map<ExternalRerankBand, RankedCandidate[]>([
+      ["implementation", []],
+      ["documentation", []],
+      ["test", []],
+      ["other", []],
+    ]);
+
+    for (const candidate of head) {
+      const band = classifyExternalRerankBand(candidate, preferSourcePaths, docIntent);
+      grouped.get(band)?.push(candidate);
+    }
+
+    const orderedBands: ExternalRerankBand[] = preferSourcePaths
+      ? ["implementation", "other", "documentation", "test"]
+      : docIntent
+        ? ["documentation", "implementation", "other", "test"]
+        : ["implementation", "other", "documentation", "test"];
+
+    try {
+      const rerankedHead: RankedCandidate[] = [];
+      for (const band of orderedBands) {
+        const bandCandidates = grouped.get(band) ?? [];
+        if (bandCandidates.length <= 1) {
+          rerankedHead.push(...bandCandidates);
+          continue;
+        }
+
+        const documents = await Promise.all(
+          bandCandidates.map(async (candidate) => ({
+            id: candidate.id,
+            text: await this.createRerankerDocumentText(candidate),
+          }))
+        );
+        const rankedIds = await this.callExternalReranker(query, documents, reranker);
+        if (rankedIds.length === 0) {
+          rerankedHead.push(...bandCandidates);
+          continue;
+        }
+
+        const order = new Map(rankedIds.map((id, index) => [id, index]));
+        const bandReranked = [...bandCandidates].sort((a, b) => {
+          const aRank = order.get(a.id) ?? Number.MAX_SAFE_INTEGER;
+          const bRank = order.get(b.id) ?? Number.MAX_SAFE_INTEGER;
+          if (aRank !== bRank) {
+            return aRank - bRank;
+          }
+          if (b.score !== a.score) {
+            return b.score - a.score;
+          }
+          return a.id.localeCompare(b.id);
+        });
+        const shouldDiversifyBand = !options?.hasIdentifierHints;
+        rerankedHead.push(...diversifyCandidatesByFile(bandReranked, shouldDiversifyBand));
+      }
+
+      this.logger.search("debug", "Applied external reranker", {
+        provider: reranker.provider,
+        model: reranker.model,
+        candidateCount: head.length,
+        bands: orderedBands,
+      });
+
+      return [...rerankedHead, ...tail];
+    } catch (error) {
+      this.logger.search("warn", "External reranker failed; using deterministic order", {
+        provider: reranker.provider,
+        model: reranker.model,
+        error: getErrorMessage(error),
+      });
+      return candidates;
+    }
+  }
+
+  private async callExternalReranker(
+    query: string,
+    documents: RerankDocumentPayload[],
+    reranker: RerankerConfig
+  ): Promise<string[]> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (reranker.apiKey) {
+      headers.Authorization = `Bearer ${reranker.apiKey}`;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), reranker.timeoutMs);
+    try {
+      const response = await fetch(`${reranker.baseUrl}/rerank`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: reranker.model,
+          query,
+          documents: documents.map((document) => document.text),
+          top_n: documents.length,
+          return_documents: false,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Reranker API error: ${response.status} - ${await response.text()}`);
+      }
+
+      const body = await response.json() as {
+        results?: Array<{ index?: number; relevance_score?: number }>;
+      };
+      if (!Array.isArray(body.results)) {
+        throw new Error("Reranker API returned unexpected response format.");
+      }
+
+      return body.results
+        .map((result) => {
+          const index = typeof result.index === "number" ? result.index : -1;
+          return documents[index]?.id;
+        })
+        .filter((id): id is string => typeof id === "string");
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(`Reranker request timed out after ${reranker.timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async createRerankerDocumentText(candidate: RankedCandidate): Promise<string> {
+    const parts = [
+      `path: ${candidate.metadata.filePath}`,
+      `chunk_type: ${candidate.metadata.chunkType}`,
+      `language: ${candidate.metadata.language}`,
+      `lines: ${candidate.metadata.startLine}-${candidate.metadata.endLine}`,
+    ];
+
+    if (candidate.metadata.name) {
+      parts.push(`name: ${candidate.metadata.name}`);
+    }
+
+    const intent = isLikelyImplementationPath(candidate.metadata.filePath) ? "implementation" : "doc_or_test";
+    parts.push(`intent_hint: ${intent}`);
+
+    try {
+      const fileContent = await fsPromises.readFile(candidate.metadata.filePath, "utf-8");
+      const lines = fileContent.split("\n");
+      const snippetStartLine = Math.max(1, candidate.metadata.startLine - 2);
+      const snippetEndLine = Math.min(lines.length, candidate.metadata.endLine + 2);
+      const snippet = lines.slice(snippetStartLine - 1, snippetEndLine).join("\n").trim();
+      parts.push("snippet:");
+      parts.push(snippet.length > 0 ? snippet : "[empty]");
+    } catch {
+      parts.push("snippet:");
+      parts.push("[unavailable]");
+    }
+
+    return parts.join("\n");
   }
 
   async initialize(): Promise<void> {
@@ -2404,6 +2720,7 @@ export class Indexer {
     const rerankTopN = this.config.search.rerankTopN;
     const filterByBranch = options?.filterByBranch ?? true;
     const sourceIntent = options?.definitionIntent === true || classifyQueryIntentRaw(query) === "source";
+    const identifierHints = extractIdentifierHints(query);
 
     this.logger.search("debug", "Starting search", {
       query,
@@ -2477,11 +2794,15 @@ export class Indexer {
       hybridWeight,
       prioritizeSourcePaths: sourceIntent,
     });
+    const rerankedCombined = await this.rerankCandidatesWithApi(query, combined, {
+      definitionIntent: options?.definitionIntent === true,
+      hasIdentifierHints: identifierHints.length > 0,
+    });
     const fusionMs = performance.now() - fusionStartTime;
 
     const rescued = promoteIdentifierMatches(
       query,
-      combined,
+      rerankedCombined,
       semanticCandidates,
       keywordCandidates,
       database,
@@ -2517,7 +2838,7 @@ export class Indexer {
     const prePrimaryLane = mergeTieredResults(deterministicIdentifierLane, identifierLane, maxResults * 4);
     const primaryLane = mergeTieredResults(prePrimaryLane, symbolLane, maxResults * 4);
     const tiered = mergeTieredResults(primaryLane, rescued, maxResults * 4);
-    const hasCodeHints = extractCodeTermHints(query).length > 0 || extractIdentifierHints(query).length > 0;
+    const hasCodeHints = extractCodeTermHints(query).length > 0 || identifierHints.length > 0;
 
     const baseFiltered = tiered.filter((r) => {
       if (r.score < this.config.search.minScore) return false;
@@ -2550,70 +2871,7 @@ export class Indexer {
       : baseFiltered
     ).slice(0, maxResults);
 
-    // Apply reranking if enabled and available
-    let finalResults = filtered;
-    if (this.reranker?.isAvailable() && filtered.length > 1) {
-      const rerankStartTime = performance.now();
-
-      // Read content for reranking
-      const documentsForRerank = await Promise.all(
-        filtered.map(async (r) => {
-          try {
-            const fileContent = await fsPromises.readFile(r.metadata.filePath, "utf-8");
-            const lines = fileContent.split("\n");
-            return lines.slice(r.metadata.startLine - 1, r.metadata.endLine).join("\n");
-          } catch {
-            return r.metadata.name ?? r.metadata.chunkType;
-          }
-        })
-      );
-
-      try {
-        const rerankResponse = await this.reranker.rerank(
-          query,
-          documentsForRerank,
-          this.config.reranker?.topN ?? filtered.length
-        );
-
-        if (rerankResponse.results.length > 0) {
-          // Create a map of original index to rerank score
-          const rerankScores = new Map<number, number>();
-          for (const result of rerankResponse.results) {
-            rerankScores.set(result.index, result.relevanceScore);
-          }
-
-          // Reorder results based on rerank scores
-          const rerankedIndices = rerankResponse.results
-            .sort((a, b) => b.relevanceScore - a.relevanceScore)
-            .map(r => r.index);
-
-          // Build final results: reranked first, then remaining
-          const rerankedSet = new Set(rerankedIndices);
-          const reranked = rerankedIndices
-            .filter(idx => idx < filtered.length)
-            .map(idx => ({
-              ...filtered[idx],
-              score: rerankScores.get(idx) ?? filtered[idx].score,
-            }));
-          const remaining = filtered
-            .filter((_, idx) => !rerankedSet.has(idx));
-
-          finalResults = [...reranked, ...remaining].slice(0, maxResults);
-        }
-
-        const rerankMs = performance.now() - rerankStartTime;
-        this.logger.search("debug", "Reranking complete", {
-          documentsReranked: documentsForRerank.length,
-          rerankMs: Math.round(rerankMs * 100) / 100,
-          tokensUsed: rerankResponse.tokensUsed,
-        });
-      } catch (error) {
-        // Reranking failed, use original results
-        this.logger.search("warn", "Reranking failed, using original results", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
+    const finalResults = filtered;
 
     const totalSearchMs = performance.now() - searchStartTime;
     this.logger.recordSearch(totalSearchMs, {

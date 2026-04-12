@@ -1,7 +1,12 @@
-import { describe, expect, it } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { ChunkMetadata } from "../src/native/index.js";
 import {
+  Indexer,
   extractFilePathHint,
   fuseResultsRrf,
   fuseResultsWeighted,
@@ -11,8 +16,11 @@ import {
   stripFilePathHint,
   rerankResults,
 } from "../src/indexer/index.js";
+import { parseConfig } from "../src/config/schema.js";
 
 type Candidate = { id: string; score: number; metadata: ChunkMetadata };
+
+const tempDirs: string[] = [];
 
 function meta(overrides: Partial<ChunkMetadata>): ChunkMetadata {
   return {
@@ -26,7 +34,25 @@ function meta(overrides: Partial<ChunkMetadata>): ChunkMetadata {
   };
 }
 
+function createTempFile(relativePath: string, content: string): string {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "reranker-doc-"));
+  tempDirs.push(tempDir);
+  const filePath = path.join(tempDir, relativePath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, "utf-8");
+  return filePath;
+}
+
 describe("retrieval ranking", () => {
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("fuses hybrid results using RRF rank ordering", () => {
     const semantic: Candidate[] = [
       { id: "a", score: 0.91, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
@@ -78,6 +104,39 @@ describe("retrieval ranking", () => {
 
     const rerankedAgain = rerankResults("auth handler", candidates, 10);
     expect(rerankedAgain.map(r => r.id)).toEqual(["exactName", "pathOverlap", "generic"]);
+  });
+
+  it("diversifies exploratory queries to avoid same-file duplicates dominating top results", () => {
+    const candidates: Candidate[] = [
+      { id: "fileA-1", score: 0.96, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
+      { id: "fileA-2", score: 0.95, metadata: meta({ filePath: "/repo/src/auth.ts", name: "refreshAuth", chunkType: "function" }) },
+      { id: "fileB-1", score: 0.94, metadata: meta({ filePath: "/repo/src/session.ts", name: "loadSession", chunkType: "function" }) },
+    ];
+
+    const reranked = rerankResults("auth flow", candidates, 10);
+    expect(reranked.map((candidate) => candidate.id).slice(0, 2)).toEqual(["fileA-1", "fileB-1"]);
+  });
+
+  it("treats same-symbol duplicates as lower priority before distinct symbols", () => {
+    const candidates: Candidate[] = [
+      { id: "same-symbol-1", score: 0.96, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
+      { id: "same-symbol-2", score: 0.95, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
+      { id: "different-symbol", score: 0.94, metadata: meta({ filePath: "/repo/src/auth.ts", name: "refreshAuth", chunkType: "function" }) },
+    ];
+
+    const reranked = rerankResults("auth flow", candidates, 10);
+    expect(reranked.map((candidate) => candidate.id).slice(0, 2)).toEqual(["same-symbol-1", "different-symbol"]);
+  });
+
+  it("does not diversify away exact-definition ranking for identifier queries", () => {
+    const candidates: Candidate[] = [
+      { id: "target", score: 0.96, metadata: meta({ filePath: "/repo/src/auth.ts", name: "rankHybridResults", chunkType: "function" }) },
+      { id: "same-file-secondary", score: 0.95, metadata: meta({ filePath: "/repo/src/auth.ts", name: "rankHybridResultsHelper", chunkType: "function" }) },
+      { id: "other-file", score: 0.94, metadata: meta({ filePath: "/repo/src/session.ts", name: "loadSession", chunkType: "function" }) },
+    ];
+
+    const reranked = rerankResults("where is rankHybridResults implementation", candidates, 10);
+    expect(reranked.map((candidate) => candidate.id).slice(0, 2)).toEqual(["target", "same-file-secondary"]);
   });
 
   it("applies hybrid ranking path for search and semantic-only rerank for findSimilar", () => {
@@ -332,5 +391,324 @@ describe("retrieval ranking", () => {
   it("strips file path suffix from embedding query text", () => {
     const query = "where is createSystem implementation in packages/react/src/styled-system/system.ts";
     expect(stripFilePathHint(query)).toBe("where is createSystem implementation");
+  });
+
+  it("applies external reranker ordering when configured", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embed",
+        dimensions: 8,
+      },
+      reranker: {
+        enabled: true,
+        provider: "custom",
+        model: "mock-reranker",
+        baseUrl: "https://rerank.example/v1",
+        topN: 3,
+      },
+    });
+    const indexer = new Indexer("/repo", config);
+
+    const firstPath = createTempFile("src/first.ts", "export function firstThing() {\n  return 'first';\n}\n");
+    const secondPath = createTempFile("src/second.ts", "export function secondThing() {\n  return 'second';\n}\n");
+    const thirdPath = createTempFile("src/third.ts", "export function thirdThing() {\n  return 'third';\n}\n");
+
+    const fetchSpy = globalThis.fetch;
+    let rerankBody: { documents?: string[] } | undefined;
+    globalThis.fetch = (async (input, init) => {
+      if (String(input).includes("/rerank")) {
+        rerankBody = JSON.parse(String(init?.body ?? "{}")) as { documents?: string[] };
+        return new Response(JSON.stringify({
+          results: [
+            { index: 2, relevance_score: 0.99 },
+            { index: 0, relevance_score: 0.72 },
+            { index: 1, relevance_score: 0.4 },
+          ],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 8 }, () => 0.1) }], usage: { total_tokens: 1 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const candidates: Candidate[] = [
+      { id: "first", score: 0.9, metadata: meta({ filePath: firstPath, name: "firstThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "second", score: 0.89, metadata: meta({ filePath: secondPath, name: "secondThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "third", score: 0.88, metadata: meta({ filePath: thirdPath, name: "thirdThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+    ];
+
+    const reranked = await (indexer as unknown as {
+      rerankCandidatesWithApi(query: string, items: Candidate[]): Promise<Candidate[]>;
+    }).rerankCandidatesWithApi("find third thing", candidates);
+
+    expect(reranked.map((candidate) => candidate.id)).toEqual(["third", "first", "second"]);
+    expect(rerankBody?.documents?.[0]).toContain("snippet:");
+    expect(rerankBody?.documents?.[0]).toContain("export function firstThing()");
+    expect(rerankBody?.documents?.[0]).toContain("intent_hint: implementation");
+    globalThis.fetch = fetchSpy;
+  });
+
+  it("falls back to deterministic order when external reranker fails", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embed",
+        dimensions: 8,
+      },
+      reranker: {
+        enabled: true,
+        provider: "custom",
+        model: "mock-reranker",
+        baseUrl: "https://rerank.example/v1",
+        topN: 2,
+      },
+    });
+    const indexer = new Indexer("/repo", config);
+
+    const firstPath = createTempFile("src/first.ts", "export function firstThing() {\n  return 'first';\n}\n");
+    const secondPath = createTempFile("src/second.ts", "export function secondThing() {\n  return 'second';\n}\n");
+    const thirdPath = createTempFile("src/third.ts", "export function thirdThing() {\n  return 'third';\n}\n");
+
+    const fetchSpy = globalThis.fetch;
+    globalThis.fetch = (async (input) => {
+      if (String(input).includes("/rerank")) {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 8 }, () => 0.1) }], usage: { total_tokens: 1 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const candidates: Candidate[] = [
+      { id: "first", score: 0.9, metadata: meta({ filePath: firstPath, name: "firstThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "second", score: 0.89, metadata: meta({ filePath: secondPath, name: "secondThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "third", score: 0.88, metadata: meta({ filePath: thirdPath, name: "thirdThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+    ];
+
+    const reranked = await (indexer as unknown as {
+      rerankCandidatesWithApi(query: string, items: Candidate[]): Promise<Candidate[]>;
+    }).rerankCandidatesWithApi("find third thing", candidates);
+
+    expect(reranked.map((candidate) => candidate.id)).toEqual(["first", "second", "third"]);
+    globalThis.fetch = fetchSpy;
+  });
+
+  it("skips external reranker for definition-intent queries with identifier hints", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embed",
+        dimensions: 8,
+      },
+      reranker: {
+        enabled: true,
+        provider: "custom",
+        model: "mock-reranker",
+        baseUrl: "https://rerank.example/v1",
+        topN: 3,
+      },
+    });
+    const indexer = new Indexer("/repo", config);
+
+    const fetchSpy = globalThis.fetch;
+    let rerankCalled = false;
+    globalThis.fetch = (async (input) => {
+      if (String(input).includes("/rerank")) {
+        rerankCalled = true;
+        return new Response(JSON.stringify({
+          results: [
+            { index: 2, relevance_score: 0.99 },
+            { index: 0, relevance_score: 0.72 },
+            { index: 1, relevance_score: 0.4 },
+          ],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 8 }, () => 0.1) }], usage: { total_tokens: 1 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const candidates: Candidate[] = [
+      { id: "first", score: 0.9, metadata: meta({ filePath: "/repo/src/first.ts", name: "rankHybridResults", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "second", score: 0.89, metadata: meta({ filePath: "/repo/src/second.ts", name: "otherThing", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "third", score: 0.88, metadata: meta({ filePath: "/repo/README.md", name: "docs", chunkType: "other", startLine: 1, endLine: 3 }) },
+    ];
+
+    const reranked = await (indexer as unknown as {
+      rerankCandidatesWithApi(
+        query: string,
+        items: Candidate[],
+        options?: { definitionIntent?: boolean; hasIdentifierHints?: boolean }
+      ): Promise<Candidate[]>;
+    }).rerankCandidatesWithApi("where is rankHybridResults implementation", candidates, {
+      hasIdentifierHints: true,
+    });
+
+    expect(rerankCalled).toBe(false);
+    expect(reranked.map((candidate) => candidate.id)).toEqual(["first", "second", "third"]);
+    globalThis.fetch = fetchSpy;
+  });
+
+  it("allows external reranker for documentation intent even when identifier hints are present", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embed",
+        dimensions: 8,
+      },
+      reranker: {
+        enabled: true,
+        provider: "custom",
+        model: "mock-reranker",
+        baseUrl: "https://rerank.example/v1",
+        topN: 3,
+      },
+    });
+    const indexer = new Indexer("/repo", config);
+
+    const fetchSpy = globalThis.fetch;
+    let rerankCalled = false;
+    let rerankDocuments: string[] | undefined;
+    globalThis.fetch = (async (input, init) => {
+      if (String(input).includes("/rerank")) {
+        rerankCalled = true;
+        rerankDocuments = (JSON.parse(String(init?.body ?? "{}")) as { documents?: string[] }).documents;
+        return new Response(JSON.stringify({
+          results: [
+            { index: 1, relevance_score: 0.99 },
+            { index: 0, relevance_score: 0.6 },
+          ],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 8 }, () => 0.1) }], usage: { total_tokens: 1 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const candidates: Candidate[] = [
+      { id: "impl", score: 0.9, metadata: meta({ filePath: "/repo/src/indexer/index.ts", name: "rankHybridResults", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "docs-readme", score: 0.89, metadata: meta({ filePath: "/repo/README.md", name: "retrieval documentation", chunkType: "other", startLine: 1, endLine: 3 }) },
+      { id: "docs-guide", score: 0.88, metadata: meta({ filePath: "/repo/docs/guide.md", name: "rankHybridResults guide", chunkType: "other", startLine: 1, endLine: 3 }) },
+    ];
+
+    const reranked = await (indexer as unknown as {
+      rerankCandidatesWithApi(
+        query: string,
+        items: Candidate[],
+        options?: { definitionIntent?: boolean; hasIdentifierHints?: boolean }
+      ): Promise<Candidate[]>;
+    }).rerankCandidatesWithApi("rankHybridResults documentation guide", candidates, {
+      hasIdentifierHints: true,
+    });
+
+    expect(rerankCalled).toBe(true);
+    expect(reranked.map((candidate) => candidate.id)).toEqual(["docs-guide", "docs-readme", "impl"]);
+    expect(rerankDocuments?.length).toBe(2);
+    expect(rerankDocuments?.[0]).toContain("path: /repo/README.md");
+    expect(rerankDocuments?.[1]).toContain("path: /repo/docs/guide.md");
+    globalThis.fetch = fetchSpy;
+  });
+
+  it("diversifies external reranker output for exploratory queries", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embed",
+        dimensions: 8,
+      },
+      reranker: {
+        enabled: true,
+        provider: "custom",
+        model: "mock-reranker",
+        baseUrl: "https://rerank.example/v1",
+        topN: 3,
+      },
+    });
+    const indexer = new Indexer("/repo", config);
+
+    const fileA1 = createTempFile("src/auth.ts", "export function validateAuth() {\n  return true;\n}\n");
+    const fileA2 = fileA1;
+    const fileB = createTempFile("src/session.ts", "export function loadSession() {\n  return 'session';\n}\n");
+
+    const fetchSpy = globalThis.fetch;
+    globalThis.fetch = (async (input) => {
+      if (String(input).includes("/rerank")) {
+        return new Response(JSON.stringify({
+          results: [
+            { index: 0, relevance_score: 0.99 },
+            { index: 1, relevance_score: 0.98 },
+            { index: 2, relevance_score: 0.4 },
+          ],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 8 }, () => 0.1) }], usage: { total_tokens: 1 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const candidates: Candidate[] = [
+      { id: "fileA-1", score: 0.95, metadata: meta({ filePath: fileA1, name: "validateAuth", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "fileA-2", score: 0.94, metadata: meta({ filePath: fileA2, name: "refreshAuth", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "fileB", score: 0.93, metadata: meta({ filePath: fileB, name: "loadSession", chunkType: "function", startLine: 1, endLine: 3 }) },
+    ];
+
+    const reranked = await (indexer as unknown as {
+      rerankCandidatesWithApi(
+        query: string,
+        items: Candidate[],
+        options?: { definitionIntent?: boolean; hasIdentifierHints?: boolean }
+      ): Promise<Candidate[]>;
+    }).rerankCandidatesWithApi("auth flow", candidates);
+
+    expect(reranked.map((candidate) => candidate.id).slice(0, 2)).toEqual(["fileA-1", "fileB"]);
+    globalThis.fetch = fetchSpy;
+  });
+
+  it("diversifies external reranker duplicates by symbol before repeating the same symbol", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embed",
+        dimensions: 8,
+      },
+      reranker: {
+        enabled: true,
+        provider: "custom",
+        model: "mock-reranker",
+        baseUrl: "https://rerank.example/v1",
+        topN: 3,
+      },
+    });
+    const indexer = new Indexer("/repo", config);
+
+    const authFile = createTempFile("src/auth.ts", "export function validateAuth() {\n  return true;\n}\nexport function refreshAuth() {\n  return false;\n}\n");
+
+    const fetchSpy = globalThis.fetch;
+    globalThis.fetch = (async (input) => {
+      if (String(input).includes("/rerank")) {
+        return new Response(JSON.stringify({
+          results: [
+            { index: 0, relevance_score: 0.99 },
+            { index: 1, relevance_score: 0.98 },
+            { index: 2, relevance_score: 0.4 },
+          ],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 8 }, () => 0.1) }], usage: { total_tokens: 1 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const candidates: Candidate[] = [
+      { id: "same-symbol-1", score: 0.95, metadata: meta({ filePath: authFile, name: "validateAuth", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "same-symbol-2", score: 0.94, metadata: meta({ filePath: authFile, name: "validateAuth", chunkType: "function", startLine: 1, endLine: 3 }) },
+      { id: "different-symbol", score: 0.93, metadata: meta({ filePath: authFile, name: "refreshAuth", chunkType: "function", startLine: 4, endLine: 6 }) },
+    ];
+
+    const reranked = await (indexer as unknown as {
+      rerankCandidatesWithApi(
+        query: string,
+        items: Candidate[],
+        options?: { definitionIntent?: boolean; hasIdentifierHints?: boolean }
+      ): Promise<Candidate[]>;
+    }).rerankCandidatesWithApi("auth flow", candidates);
+
+    expect(reranked.map((candidate) => candidate.id).slice(0, 2)).toEqual(["same-symbol-1", "different-symbol"]);
+    globalThis.fetch = fetchSpy;
   });
 });

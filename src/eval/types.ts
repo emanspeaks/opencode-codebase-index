@@ -34,10 +34,12 @@ export interface EvalBudget {
   thresholds: {
     hitAt5MaxDrop?: number;
     mrrAt10MaxDrop?: number;
+    rawDistinctTop3RatioMaxDrop?: number;
     p95LatencyMaxMultiplier?: number;
     p95LatencyMaxAbsoluteMs?: number;
     minHitAt5?: number;
     minMrrAt10?: number;
+    minRawDistinctTop3Ratio?: number;
   };
 }
 
@@ -68,6 +70,7 @@ export interface PerQueryEvalResult {
   reciprocalRankAt10: number;
   ndcgAt10: number;
   failureBucket?: FailureBucket;
+  rawTop3DistinctRatio: number;
   results: EvalSearchResult[];
 }
 
@@ -78,6 +81,8 @@ export interface EvalMetrics {
   hitAt10: number;
   mrrAt10: number;
   ndcgAt10: number;
+  distinctTop3Ratio: number;
+  rawDistinctTop3Ratio: number;
   latencyMs: {
     p50: number;
     p95: number;
@@ -123,6 +128,8 @@ export interface EvalComparison {
     hitAt10: MetricDelta;
     mrrAt10: MetricDelta;
     ndcgAt10: MetricDelta;
+    distinctTop3Ratio: MetricDelta;
+    rawDistinctTop3Ratio: MetricDelta;
     latencyP50Ms: MetricDelta;
     latencyP95Ms: MetricDelta;
     latencyP99Ms: MetricDelta;
