@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseConfig } from "../src/config/schema.js";
 import { Indexer } from "../src/indexer/index.js";
 import { Database } from "../src/native/index.js";
+import { hashContent } from "../src/native/index.js";
 
 describe("indexer clearIndex force rebuild", () => {
   let tempDir: string;
@@ -217,5 +218,74 @@ describe("indexer clearIndex force rebuild", () => {
     const rebuiltStats = await rebuiltIndexer.index();
     expect(rebuiltStats.failedChunks).toBe(0);
     expect(rebuiltStats.indexedChunks).toBeGreaterThan(0);
+  });
+
+  it("preserves shared knowledge-base rows still referenced by another global project", async () => {
+    vi.stubEnv("HOME", tempHome);
+
+    const projectA = path.join(tempDir, "project-a");
+    const projectB = path.join(tempDir, "project-b");
+    const kbDir = path.join(tempDir, "shared-kb");
+    const projectAFile = path.join(projectA, "src", "a.ts");
+    const projectBFile = path.join(projectB, "src", "b.ts");
+    const kbFile = path.join(kbDir, "docs", "shared.ts");
+
+    fs.mkdirSync(path.dirname(projectAFile), { recursive: true });
+    fs.mkdirSync(path.dirname(projectBFile), { recursive: true });
+    fs.mkdirSync(path.dirname(kbFile), { recursive: true });
+    fs.writeFileSync(projectAFile, "export function alpha() { return 'a'; }\n", "utf-8");
+    fs.writeFileSync(projectBFile, "export function beta() { return 'b'; }\n", "utf-8");
+    fs.writeFileSync(kbFile, "export function sharedDoc() { return 'shared'; }\n", "utf-8");
+
+    const createKbIndexer = (projectRoot: string) => new Indexer(projectRoot, parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-8d",
+        dimensions: 8,
+      },
+      scope: "global",
+      knowledgeBases: [kbDir],
+      indexing: {
+        watchFiles: false,
+        retries: 0,
+        retryDelayMs: 1,
+      },
+    }));
+
+    await createKbIndexer(projectA).index();
+    await createKbIndexer(projectB).index();
+    await createKbIndexer(projectA).clearIndex();
+
+    const dbPath = path.join(tempHome, ".opencode", "global-index", "codebase.db");
+    const db = new Database(dbPath);
+    expect(db.getChunksByFile(projectAFile)).toHaveLength(0);
+    expect(db.getChunksByFile(projectBFile).length).toBeGreaterThan(0);
+    expect(db.getChunksByFile(kbFile).length).toBeGreaterThan(0);
+  });
+
+  it("keeps legacy global branch catalogs readable until the project is reindexed", async () => {
+    vi.stubEnv("HOME", tempHome);
+
+    const projectA = path.join(tempDir, "project-a");
+    const projectAFile = path.join(projectA, "src", "a.ts");
+    fs.mkdirSync(path.dirname(projectAFile), { recursive: true });
+    fs.writeFileSync(projectAFile, "export function alpha() { return 'a'; }\n", "utf-8");
+
+    const legacyIndexer = createIndexer(projectA, 8, "global");
+    await legacyIndexer.index();
+
+    const dbPath = path.join(tempHome, ".opencode", "global-index", "codebase.db");
+    const db = new Database(dbPath);
+    const currentChunk = db.getChunksByFile(projectAFile)[0];
+    const currentBranchKey = `${hashContent(path.resolve(projectA)).slice(0, 16)}:default`;
+
+    db.clearBranch(currentBranchKey);
+    db.addChunksToBranchBatch("default", [currentChunk.chunkId]);
+    db.deleteMetadata("index.globalBranchKeyVersion");
+
+    const migratedIndexer = createIndexer(projectA, 8, "global");
+    const searchResults = await migratedIndexer.search("alpha", 5);
+    expect(searchResults.some((result) => result.filePath === projectAFile)).toBe(true);
   });
 });
