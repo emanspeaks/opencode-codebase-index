@@ -297,6 +297,36 @@ describe("indexer clearIndex force rebuild", () => {
     expect(searchResults.some((result) => result.filePath === projectBFile)).toBe(true);
   });
 
+  it("clears both legacy and namespaced branch rows for the current repo during global force reset", async () => {
+    vi.stubEnv("HOME", tempHome);
+
+    const projectA = path.join(tempDir, "project-a");
+    const projectAFile = path.join(projectA, "src", "a.ts");
+    fs.mkdirSync(path.dirname(projectAFile), { recursive: true });
+    fs.writeFileSync(projectAFile, "export function alpha() { return 'a'; }\n", "utf-8");
+
+    const indexerA = createIndexer(projectA, 8, "global");
+    await indexerA.index();
+
+    const dbPath = path.join(tempHome, ".opencode", "global-index", "codebase.db");
+    const db = new Database(dbPath);
+    const projectAChunk = db.getChunksByFile(projectAFile)[0];
+    const namespacedBranch = `${hashContent(path.resolve(projectA)).slice(0, 16)}:default`;
+
+    db.addChunksToBranchBatch("default", [projectAChunk.chunkId]);
+
+    await indexerA.clearIndex();
+
+    expect(db.chunkExistsOnBranch(namespacedBranch, projectAChunk.chunkId)).toBe(false);
+    expect(db.chunkExistsOnBranch("default", projectAChunk.chunkId)).toBe(false);
+
+    const rebuiltStats = await createIndexer(projectA, 8, "global").index();
+    expect(rebuiltStats.failedChunks).toBe(0);
+
+    const searchResults = await createIndexer(projectA, 8, "global").search("alpha", 5);
+    expect(searchResults.filter((result) => result.filePath === projectAFile)).toHaveLength(1);
+  });
+
   it("preserves resolved call edges for shared symbols kept by another global project", async () => {
     vi.stubEnv("HOME", tempHome);
 
