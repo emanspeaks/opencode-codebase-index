@@ -1594,7 +1594,9 @@ export class Indexer {
       ...scopedEntries.map(({ metadata }) => metadata.filePath),
     ]);
 
-    database.deleteBranchChunksForBranch(this.getBranchCatalogKey(), removedChunkIds);
+    for (const branchKey of this.getBranchCatalogKeys()) {
+      database.deleteBranchChunksForBranch(branchKey, removedChunkIds);
+    }
     const sharedChunkIds = new Set(database.getReferencedChunkIds(removedChunkIds));
     const removableChunkIds = removedChunkIds.filter((chunkId) => !sharedChunkIds.has(chunkId));
 
@@ -1610,7 +1612,9 @@ export class Indexer {
       }
     }
 
-    database.deleteBranchSymbolsForBranch(this.getBranchCatalogKey(), symbolIds);
+    for (const branchKey of this.getBranchCatalogKeys()) {
+      database.deleteBranchSymbolsForBranch(branchKey, symbolIds);
+    }
     const sharedSymbolIds = new Set(database.getReferencedSymbolIds(symbolIds));
     const removableSymbolIds = symbolIds.filter((symbolId) => !sharedSymbolIds.has(symbolId));
 
@@ -2114,7 +2118,7 @@ export class Indexer {
     if (chunkDataBatch.length > 0) {
       this.database.upsertChunksBatch(chunkDataBatch);
     }
-    this.database.addChunksToBranchBatch(this.currentBranch || "default", chunkIds);
+    this.database.addChunksToBranchBatch(this.getBranchCatalogKey(), chunkIds);
   }
 
   private loadIndexMetadata(): IndexMetadata | null {
@@ -3237,7 +3241,6 @@ export class Indexer {
         database.deleteMetadata("index.embeddingProvider");
         database.deleteMetadata("index.embeddingModel");
         database.deleteMetadata("index.embeddingDimensions");
-        database.deleteMetadata("index.globalBranchKeyVersion");
         database.deleteMetadata("index.createdAt");
         database.deleteMetadata("index.updatedAt");
 
@@ -3272,7 +3275,6 @@ export class Indexer {
     database.deleteMetadata("index.embeddingProvider");
     database.deleteMetadata("index.embeddingModel");
     database.deleteMetadata("index.embeddingDimensions");
-    database.deleteMetadata("index.globalBranchKeyVersion");
     database.deleteMetadata("index.createdAt");
     database.deleteMetadata("index.updatedAt");
 
