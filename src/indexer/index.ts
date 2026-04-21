@@ -204,7 +204,6 @@ interface IndexCompatibility {
 
 const INDEX_METADATA_VERSION = "1";
 const RANKING_TOKEN_CACHE_LIMIT = 4096;
-const GLOBAL_BRANCH_KEY_VERSION = "2";
 
 function isPathWithinRoot(filePath: string, rootPath: string): boolean {
   const normalizedFilePath = path.resolve(filePath);
@@ -1520,11 +1519,6 @@ export class Indexer {
       return [primary];
     }
 
-    const version = this.database?.getMetadata("index.globalBranchKeyVersion");
-    if (version === GLOBAL_BRANCH_KEY_VERSION) {
-      return [primary];
-    }
-
     const legacy = this.getLegacyBranchCatalogKey();
     return primary === legacy ? [primary] : [primary, legacy];
   }
@@ -1600,13 +1594,14 @@ export class Indexer {
       ...scopedEntries.map(({ metadata }) => metadata.filePath),
     ]);
 
-    for (const chunkId of removedChunkIds) {
+    database.deleteBranchChunksForBranch(this.getBranchCatalogKey(), removedChunkIds);
+    const sharedChunkIds = new Set(database.getReferencedChunkIds(removedChunkIds));
+    const removableChunkIds = removedChunkIds.filter((chunkId) => !sharedChunkIds.has(chunkId));
+
+    for (const chunkId of removableChunkIds) {
       store.remove(chunkId);
       invertedIndex.removeChunk(chunkId);
     }
-
-    database.deleteBranchChunksForBranch(this.getBranchCatalogKey(), removedChunkIds);
-    const sharedChunkIds = new Set(database.getReferencedChunkIds(removedChunkIds));
 
     const symbolIds: string[] = [];
     for (const filePath of filePaths) {
@@ -1615,9 +1610,11 @@ export class Indexer {
       }
     }
 
-    database.clearCallEdgeTargetsForSymbols(symbolIds);
     database.deleteBranchSymbolsForBranch(this.getBranchCatalogKey(), symbolIds);
     const sharedSymbolIds = new Set(database.getReferencedSymbolIds(symbolIds));
+    const removableSymbolIds = symbolIds.filter((symbolId) => !sharedSymbolIds.has(symbolId));
+
+    database.clearCallEdgeTargetsForSymbols(removableSymbolIds);
 
     for (const filePath of filePaths) {
       const fileChunkIds = database.getChunksByFile(filePath).map((chunk) => chunk.chunkId);
@@ -2146,9 +2143,6 @@ export class Indexer {
     this.database.setMetadata("index.embeddingProvider", provider.provider);
     this.database.setMetadata("index.embeddingModel", provider.modelInfo.model);
     this.database.setMetadata("index.embeddingDimensions", provider.modelInfo.dimensions.toString());
-    if (this.config.scope === "global") {
-      this.database.setMetadata("index.globalBranchKeyVersion", GLOBAL_BRANCH_KEY_VERSION);
-    }
     this.database.setMetadata("index.updatedAt", now);
 
     if (!existingCreatedAt) {
