@@ -1606,17 +1606,24 @@ export class Indexer {
   ): { removedChunkIds: string[]; hasForeignData: boolean } {
     const allMetadata = store.getAllMetadata();
     const scopedEntries = allMetadata.filter(({ metadata }) => this.isFileInCurrentScope(metadata.filePath, roots));
-    const removedChunkIds = scopedEntries.map(({ key }) => key);
     const filePaths = new Set<string>([
       ...Array.from(this.fileHashCache.keys()).filter((filePath) => this.isFileInCurrentScope(filePath, roots)),
       ...scopedEntries.map(({ metadata }) => metadata.filePath),
     ]);
 
-    for (const branchKey of this.getBranchCatalogKeys()) {
-      database.deleteBranchChunksForBranch(branchKey, removedChunkIds);
+    const removedChunkIds = new Set<string>(scopedEntries.map(({ key }) => key));
+    for (const filePath of filePaths) {
+      for (const chunk of database.getChunksByFile(filePath)) {
+        removedChunkIds.add(chunk.chunkId);
+      }
     }
-    const sharedChunkIds = new Set(database.getReferencedChunkIds(removedChunkIds));
-    const removableChunkIds = removedChunkIds.filter((chunkId) => !sharedChunkIds.has(chunkId));
+    const removedChunkIdList = Array.from(removedChunkIds);
+
+    for (const branchKey of this.getBranchCatalogKeys()) {
+      database.deleteBranchChunksForBranch(branchKey, removedChunkIdList);
+    }
+    const sharedChunkIds = new Set(database.getReferencedChunkIds(removedChunkIdList));
+    const removableChunkIds = removedChunkIdList.filter((chunkId) => !sharedChunkIds.has(chunkId));
 
     for (const chunkId of removableChunkIds) {
       store.remove(chunkId);
@@ -1661,7 +1668,7 @@ export class Indexer {
     invertedIndex.save();
 
     return {
-      removedChunkIds,
+      removedChunkIds: removedChunkIdList,
       hasForeignData: allMetadata.some(({ metadata }) => !this.isFileInCurrentScope(metadata.filePath, roots)),
     };
   }
