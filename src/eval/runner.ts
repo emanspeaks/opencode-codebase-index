@@ -63,8 +63,14 @@ function getIndexRootPath(projectRoot: string, scope: "project" | "global"): str
     : resolveProjectIndexPath(projectRoot, scope);
 }
 
+function getLocalProjectIndexRoot(projectRoot: string): string {
+  return path.join(projectRoot, ".opencode", "index");
+}
+
 function clearIndexRoot(projectRoot: string, scope: "project" | "global"): void {
-  const indexRoot = getIndexRootPath(projectRoot, scope);
+  const indexRoot = scope === "global"
+    ? getIndexRootPath(projectRoot, scope)
+    : getLocalProjectIndexRoot(projectRoot);
   if (existsSync(indexRoot)) {
     rmSync(indexRoot, { recursive: true, force: true });
   }
