@@ -1,6 +1,8 @@
 import { existsSync } from "fs";
+import { mkdirSync } from "fs";
 import { readFileSync } from "fs";
 import { rmSync } from "fs";
+import { writeFileSync } from "fs";
 import * as os from "os";
 import * as path from "path";
 import { performance } from "perf_hooks";
@@ -67,6 +69,10 @@ function getLocalProjectIndexRoot(projectRoot: string): string {
   return path.join(projectRoot, ".opencode", "index");
 }
 
+function getLocalProjectConfigPath(projectRoot: string): string {
+  return path.join(projectRoot, ".opencode", "codebase-index.json");
+}
+
 function clearIndexRoot(projectRoot: string, scope: "project" | "global"): void {
   const indexRoot = scope === "global"
     ? getIndexRootPath(projectRoot, scope)
@@ -74,6 +80,25 @@ function clearIndexRoot(projectRoot: string, scope: "project" | "global"): void 
   if (existsSync(indexRoot)) {
     rmSync(indexRoot, { recursive: true, force: true });
   }
+}
+
+function ensureLocalEvalProjectConfig(projectRoot: string, configPath?: string): void {
+  if (configPath) {
+    return;
+  }
+
+  const localConfigPath = getLocalProjectConfigPath(projectRoot);
+  if (existsSync(localConfigPath)) {
+    return;
+  }
+
+  const resolvedConfigPath = resolveProjectConfigPath(projectRoot);
+  if (!existsSync(resolvedConfigPath) || resolvedConfigPath === localConfigPath) {
+    return;
+  }
+
+  mkdirSync(path.dirname(localConfigPath), { recursive: true });
+  writeFileSync(localConfigPath, readFileSync(resolvedConfigPath, "utf-8"), "utf-8");
 }
 
 function loadParsedConfig(projectRoot: string, configPath?: string) {
@@ -122,6 +147,11 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
   const budgetPath = options.budgetPath ? toAbsolute(options.projectRoot, options.budgetPath) : undefined;
 
   const dataset = loadGoldenDataset(datasetPath);
+
+  if (options.reindex) {
+    ensureLocalEvalProjectConfig(options.projectRoot, options.configPath);
+  }
+
   const parsedConfig = loadParsedConfig(options.projectRoot, options.configPath);
   const effectiveConfig = resolveSearchConfig(parsedConfig, options.searchOverrides);
 

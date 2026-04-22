@@ -224,6 +224,97 @@ describe("eval runner", () => {
     expect(readFileSync(path.join(mainRepoDir, ".opencode", "index", "sentinel.txt"), "utf-8")).toBe("keep-me");
   });
 
+  it("creates a local eval config boundary when reindexing from a fallback worktree", async () => {
+    const mainRepoDir = path.join(tempDir, "main-repo");
+    const worktreeDir = path.join(tempDir, "worktree-feature");
+    const worktreeGitDir = path.join(mainRepoDir, ".git", "worktrees", "feature");
+
+    mkdirSync(path.join(mainRepoDir, ".git", "refs", "heads"), { recursive: true });
+    mkdirSync(path.join(mainRepoDir, ".opencode", "index"), { recursive: true });
+    mkdirSync(path.join(mainRepoDir, "src", "indexer"), { recursive: true });
+    mkdirSync(path.join(mainRepoDir, "src", "tools"), { recursive: true });
+    mkdirSync(path.join(mainRepoDir, "benchmarks", "golden"), { recursive: true });
+    mkdirSync(worktreeGitDir, { recursive: true });
+    mkdirSync(worktreeDir, { recursive: true });
+
+    writeFileSync(path.join(mainRepoDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(path.join(mainRepoDir, ".git", "refs", "heads", "main"), "1111111111111111111111111111111111111111\n");
+    writeFileSync(path.join(worktreeDir, ".git"), `gitdir: ${worktreeGitDir}\n`);
+    writeFileSync(path.join(worktreeGitDir, "HEAD"), "ref: refs/heads/feature\n");
+    writeFileSync(path.join(worktreeGitDir, "commondir"), "../..\n");
+
+    writeFileSync(
+      path.join(mainRepoDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    writeFileSync(
+      path.join(mainRepoDir, "src", "indexer", "index.ts"),
+      "export function rankHybridResults(query: string) { return query.length; }\n",
+      "utf-8"
+    );
+    writeFileSync(
+      path.join(mainRepoDir, "src", "tools", "index.ts"),
+      "export const codebase_search = () => 'ok';\n",
+      "utf-8"
+    );
+    writeFileSync(
+      path.join(mainRepoDir, "benchmarks", "golden", "small.json"),
+      JSON.stringify(
+        {
+          version: "1.0.0",
+          name: "small",
+          queries: [
+            {
+              id: "q1",
+              query: "where is rankHybridResults implementation",
+              queryType: "definition",
+              expected: {
+                filePath: "src/indexer/index.ts",
+                symbol: "rankHybridResults",
+              },
+            },
+          ],
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    await runEvaluation({
+      projectRoot: worktreeDir,
+      datasetPath: path.relative(worktreeDir, path.join(mainRepoDir, "benchmarks", "golden", "small.json")),
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: true,
+    });
+
+    expect(readFileSync(path.join(worktreeDir, ".opencode", "codebase-index.json"), "utf-8")).toContain("mock-embedding-model");
+  });
+
   it("compares against baseline and writes compare artifact", async () => {
     const baselineRun = await runEvaluation({
       projectRoot: tempDir,
