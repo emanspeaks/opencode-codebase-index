@@ -8,6 +8,7 @@ import { performance } from "perf_hooks";
 import { parseConfig } from "../config/schema.js";
 import type { SearchConfig as ConfigSearchConfig } from "../config/schema.js";
 import { getDefaultModelForProvider } from "../config/index.js";
+import { getGlobalIndexPath, resolveProjectConfigPath, resolveProjectIndexPath } from "../config/paths.js";
 import { Indexer } from "../indexer/index.js";
 
 import { evaluateBudgetGate } from "./budget.js";
@@ -43,7 +44,7 @@ function loadRawConfig(projectRoot: string, configPath?: string): unknown {
     return JSON.parse(readFileSync(fromPath, "utf-8"));
   }
 
-  const projectConfig = path.join(projectRoot, ".opencode", "codebase-index.json");
+  const projectConfig = resolveProjectConfigPath(projectRoot);
   if (existsSync(projectConfig)) {
     return JSON.parse(readFileSync(projectConfig, "utf-8"));
   }
@@ -57,10 +58,9 @@ function loadRawConfig(projectRoot: string, configPath?: string): unknown {
 }
 
 function getIndexRootPath(projectRoot: string, scope: "project" | "global"): string {
-  if (scope === "global") {
-    return path.join(os.homedir(), ".opencode", "global-index");
-  }
-  return path.join(projectRoot, ".opencode", "index");
+  return scope === "global"
+    ? getGlobalIndexPath()
+    : resolveProjectIndexPath(projectRoot, scope);
 }
 
 function clearIndexRoot(projectRoot: string, scope: "project" | "global"): void {
