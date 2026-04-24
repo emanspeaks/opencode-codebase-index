@@ -435,6 +435,22 @@ describe("tools utils", () => {
   });
 
   describe("formatHealthCheck", () => {
+    it("should show corruption reset warning when health check reset the local index", () => {
+      const result = formatHealthCheck({
+        removed: 0,
+        filePaths: [],
+        gcOrphanEmbeddings: 0,
+        gcOrphanChunks: 0,
+        gcOrphanSymbols: 0,
+        gcOrphanCallEdges: 0,
+        resetCorruptedIndex: true,
+        warning: "Detected a corrupted local SQLite index and reset the local index.",
+      });
+
+      expect(result).toContain("corrupted local SQLite index");
+      expect(result).toContain("reset the local index");
+    });
+
     it("should return healthy message when nothing to clean", () => {
       const result = formatHealthCheck({
         removed: 0,

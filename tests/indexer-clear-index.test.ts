@@ -220,6 +220,47 @@ describe("indexer clearIndex force rebuild", () => {
     expect(rebuiltStats.indexedChunks).toBeGreaterThan(0);
   });
 
+  it("resets a corrupted local sqlite index during health check and reports rebuild guidance", async () => {
+    embeddingDimensions = 8;
+    const indexer = createIndexer(tempDir, 8);
+    const stats = await indexer.index();
+    expect(stats.indexedChunks).toBeGreaterThan(0);
+
+    const database = (indexer as unknown as { database: Database }).database;
+    vi.spyOn(database, "gcOrphanEmbeddings").mockReturnValue(0);
+    vi.spyOn(database, "gcOrphanChunks").mockImplementation(() => {
+      throw new Error("SQLite error: database disk image is malformed");
+    });
+
+    const result = await indexer.healthCheck();
+    expect(result.resetCorruptedIndex).toBe(true);
+    expect(result.warning).toContain("reset the local index");
+
+    const status = await indexer.getStatus();
+    expect(status.indexed).toBe(false);
+    expect(status.vectorCount).toBe(0);
+  });
+
+  it("refuses to auto-reset a corrupted shared global sqlite index", async () => {
+    vi.stubEnv("HOME", tempHome);
+
+    const projectA = path.join(tempDir, "project-a");
+    const projectAFile = path.join(projectA, "src", "a.ts");
+    fs.mkdirSync(path.dirname(projectAFile), { recursive: true });
+    fs.writeFileSync(projectAFile, "export function alpha() { return 'a'; }\n", "utf-8");
+
+    const indexer = createIndexer(projectA, 8, "global");
+    await indexer.index();
+
+    const database = (indexer as unknown as { database: Database }).database;
+    vi.spyOn(database, "gcOrphanEmbeddings").mockReturnValue(0);
+    vi.spyOn(database, "gcOrphanChunks").mockImplementation(() => {
+      throw new Error("SQLite error: database disk image is malformed");
+    });
+
+    await expect(indexer.healthCheck()).rejects.toThrow("Automatic repair is disabled for global scope");
+  });
+
   it("preserves shared knowledge-base rows still referenced by another global project", async () => {
     vi.stubEnv("HOME", tempHome);
 
