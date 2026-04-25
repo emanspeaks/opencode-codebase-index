@@ -231,6 +231,7 @@ describe("eval runner", () => {
 
     mkdirSync(path.join(mainRepoDir, ".git", "refs", "heads"), { recursive: true });
     mkdirSync(path.join(mainRepoDir, ".opencode", "index"), { recursive: true });
+    mkdirSync(path.join(mainRepoDir, "docs", "reference"), { recursive: true });
     mkdirSync(path.join(mainRepoDir, "src", "indexer"), { recursive: true });
     mkdirSync(path.join(mainRepoDir, "src", "tools"), { recursive: true });
     mkdirSync(path.join(mainRepoDir, "benchmarks", "golden"), { recursive: true });
@@ -256,6 +257,8 @@ describe("eval runner", () => {
           indexing: {
             watchFiles: false,
           },
+          additionalInclude: ["docs/**/*.md"],
+          knowledgeBases: ["docs/reference"],
           search: {
             maxResults: 10,
             minScore: 0,
@@ -312,7 +315,17 @@ describe("eval runner", () => {
       reindex: true,
     });
 
-    expect(readFileSync(path.join(worktreeDir, ".opencode", "codebase-index.json"), "utf-8")).toContain("mock-embedding-model");
+    const localEvalConfig = JSON.parse(
+      readFileSync(path.join(worktreeDir, ".opencode", "codebase-index.json"), "utf-8")
+    ) as {
+      additionalInclude?: string[];
+      knowledgeBases?: string[];
+      customProvider?: { model?: string };
+    };
+
+    expect(localEvalConfig.customProvider?.model).toBe("mock-embedding-model");
+    expect(localEvalConfig.additionalInclude).toEqual(["docs/**/*.md"]);
+    expect(localEvalConfig.knowledgeBases).toEqual([path.join("..", "main-repo", "docs", "reference")]);
   });
 
   it("compares against baseline and writes compare artifact", async () => {

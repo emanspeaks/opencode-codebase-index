@@ -47,6 +47,7 @@ describe("worktree fallback (issue #60)", () => {
           indexing: {
             watchFiles: false,
           },
+          additionalInclude: ["docs/**/*.md"],
           knowledgeBases: ["docs/reference"],
         },
         null,
@@ -66,6 +67,7 @@ describe("worktree fallback (issue #60)", () => {
 
     expect(configPath).toBe(path.join(mainRepoDir, ".opencode", "codebase-index.json"));
     expect(loaded.scope).toBe("project");
+    expect(loaded.additionalInclude).toEqual(["docs/**/*.md"]);
     expect(loaded.knowledgeBases).toEqual([path.join("..", "main-repo", "docs", "reference")]);
   });
 
