@@ -21,6 +21,10 @@ function hasProjectConfig(projectRoot: string): boolean {
   return existsSync(path.join(projectRoot, PROJECT_CONFIG_RELATIVE_PATH));
 }
 
+function hasProjectIndex(projectRoot: string): boolean {
+  return existsSync(path.join(projectRoot, PROJECT_INDEX_RELATIVE_PATH));
+}
+
 export function getGlobalIndexPath(): string {
   return path.join(os.homedir(), ".opencode", "global-index");
 }
@@ -32,6 +36,15 @@ export function resolveProjectConfigPath(projectRoot: string): string {
   }
 
   return resolveWorktreeFallbackPath(projectRoot, PROJECT_CONFIG_RELATIVE_PATH) ?? localConfigPath;
+}
+
+export function resolveWritableProjectConfigPath(projectRoot: string): string {
+  const localConfigPath = path.join(projectRoot, PROJECT_CONFIG_RELATIVE_PATH);
+  if (existsSync(localConfigPath) || hasProjectIndex(projectRoot)) {
+    return localConfigPath;
+  }
+
+  return resolveProjectConfigPath(projectRoot);
 }
 
 export function resolveProjectIndexPath(projectRoot: string, scope: "project" | "global"): string {

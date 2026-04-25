@@ -19,7 +19,7 @@ import {
 import { existsSync, writeFileSync, mkdirSync, statSync } from "fs";
 import * as path from "path";
 import { loadMergedConfig } from "../config/merger.js";
-import { resolveProjectConfigPath } from "../config/paths.js";
+import { resolveProjectConfigPath, resolveWritableProjectConfigPath } from "../config/paths.js";
 
 const z = tool.schema;
 
@@ -51,6 +51,10 @@ function getIndexer(): Indexer {
 }
 
 function getConfigPath(): string {
+  return resolveWritableProjectConfigPath(sharedProjectRoot);
+}
+
+function getResolvedConfigPath(): string {
   return resolveProjectConfigPath(sharedProjectRoot);
 }
 
@@ -85,7 +89,7 @@ function serializeConfigPathValue(value: string, baseDir: string): string {
 function loadConfig(): Record<string, unknown> {
   const rawConfig = loadMergedConfig(sharedProjectRoot);
   const config: Record<string, unknown> = {};
-  const configBaseDir = path.dirname(path.dirname(getConfigPath()));
+  const configBaseDir = path.dirname(path.dirname(getResolvedConfigPath()));
   
   if (rawConfig && typeof rawConfig === "object") {
     for (const key of Object.keys(rawConfig)) {

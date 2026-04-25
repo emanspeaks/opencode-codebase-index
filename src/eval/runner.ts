@@ -84,16 +84,14 @@ function clearIndexRoot(projectRoot: string, scope: "project" | "global"): void 
 }
 
 function ensureLocalEvalProjectConfig(projectRoot: string, configPath?: string): void {
-  if (configPath) {
-    return;
-  }
-
   const localConfigPath = getLocalProjectConfigPath(projectRoot);
   if (existsSync(localConfigPath)) {
     return;
   }
 
-  const resolvedConfigPath = resolveProjectConfigPath(projectRoot);
+  const resolvedConfigPath = configPath
+    ? toAbsolute(projectRoot, configPath)
+    : resolveProjectConfigPath(projectRoot);
   if (!existsSync(resolvedConfigPath) || resolvedConfigPath === localConfigPath) {
     return;
   }

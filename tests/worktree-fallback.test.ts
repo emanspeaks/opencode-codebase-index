@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { loadMergedConfig } from "../src/config/merger.js";
 import { parseConfig } from "../src/config/schema.js";
-import { resolveProjectConfigPath, resolveProjectIndexPath } from "../src/config/paths.js";
+import { resolveProjectConfigPath, resolveProjectIndexPath, resolveWritableProjectConfigPath } from "../src/config/paths.js";
 import { Indexer } from "../src/indexer/index.js";
 
 describe("worktree fallback (issue #60)", () => {
@@ -99,7 +99,15 @@ describe("worktree fallback (issue #60)", () => {
   });
 
   it("keeps a worktree-local config on a local worktree index boundary", () => {
-    fs.mkdirSync(path.join(worktreeDir, ".opencode"), { recursive: true });
+    fs.mkdirSync(path.join(worktreeDir, ".opencode", "index"), { recursive: true });
+
+    expect(resolveWritableProjectConfigPath(worktreeDir)).toBe(path.join(worktreeDir, ".opencode", "codebase-index.json"));
+    expect(resolveProjectConfigPath(worktreeDir)).toBe(path.join(mainRepoDir, ".opencode", "codebase-index.json"));
+    expect(resolveProjectIndexPath(worktreeDir, "project")).toBe(path.join(worktreeDir, ".opencode", "index"));
+  });
+
+  it("keeps explicit worktree-local config and index when they exist", () => {
+    fs.mkdirSync(path.join(worktreeDir, ".opencode", "index"), { recursive: true });
 
     fs.writeFileSync(
       path.join(worktreeDir, ".opencode", "codebase-index.json"),
