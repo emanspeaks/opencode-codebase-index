@@ -31,6 +31,24 @@ let mockStatusResult = {
   failedBatchesPath: undefined as string | undefined,
 };
 
+let mockHealthCheckResult = {
+  removed: 0,
+  gcOrphanEmbeddings: 0,
+  gcOrphanChunks: 0,
+  gcOrphanSymbols: 0,
+  gcOrphanCallEdges: 0,
+  filePaths: [],
+} as {
+  removed: number;
+  gcOrphanEmbeddings: number;
+  gcOrphanChunks: number;
+  gcOrphanSymbols: number;
+  gcOrphanCallEdges: number;
+  filePaths: string[];
+  resetCorruptedIndex?: boolean;
+  warning?: string;
+};
+
 vi.mock("../src/indexer/index.js", () => {
   class MockIndexer {
     initialize = vi.fn().mockResolvedValue(undefined);
@@ -58,14 +76,7 @@ vi.mock("../src/indexer/index.js", () => {
     ]);
     index = vi.fn().mockImplementation(async () => mockIndexResult);
     getStatus = vi.fn().mockImplementation(async () => mockStatusResult);
-    healthCheck = vi.fn().mockResolvedValue({
-      removed: 0,
-      gcOrphanEmbeddings: 0,
-      gcOrphanChunks: 0,
-      gcOrphanSymbols: 0,
-      gcOrphanCallEdges: 0,
-      filePaths: [],
-    });
+    healthCheck = vi.fn().mockImplementation(async () => mockHealthCheckResult);
     clearIndex = vi.fn().mockResolvedValue(undefined);
     estimateCost = vi.fn().mockResolvedValue({
       filesCount: 10,
@@ -136,6 +147,14 @@ describe("MCP server tools and prompts", () => {
       compatibility: { compatible: true },
       failedBatchesCount: 0,
       failedBatchesPath: undefined,
+    };
+    mockHealthCheckResult = {
+      removed: 0,
+      gcOrphanEmbeddings: 0,
+      gcOrphanChunks: 0,
+      gcOrphanSymbols: 0,
+      gcOrphanCallEdges: 0,
+      filePaths: [],
     };
 
     const config = parseConfig({});
@@ -301,6 +320,28 @@ describe("MCP server tools and prompts", () => {
     expect(content).toHaveLength(1);
     expect(content[0].type).toBe("text");
     expect(content[0].text).toContain("healthy");
+  });
+
+  it("should surface corruption reset guidance in index_health_check output", async () => {
+    mockHealthCheckResult = {
+      removed: 0,
+      gcOrphanEmbeddings: 0,
+      gcOrphanChunks: 0,
+      gcOrphanSymbols: 0,
+      gcOrphanCallEdges: 0,
+      filePaths: [],
+      resetCorruptedIndex: true,
+      warning: "Detected a corrupted local SQLite index and reset the local index. Run index_codebase to rebuild search data.",
+    };
+
+    const result = await client.callTool({
+      name: "index_health_check",
+      arguments: {},
+    });
+
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content[0].text).toContain("corrupted local SQLite index");
+    expect(content[0].text).not.toContain("healthy");
   });
 
   it("should execute find_similar tool", async () => {

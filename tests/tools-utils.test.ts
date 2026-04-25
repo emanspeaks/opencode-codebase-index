@@ -299,6 +299,27 @@ describe("tools utils", () => {
       expect(result).toContain("/tmp/index/failed-batches.json");
     });
 
+    it("should surface startup reset guidance before generic not-indexed messaging", () => {
+      const status: StatusResult = {
+        indexed: false,
+        vectorCount: 0,
+        provider: "google",
+        model: "gemini-embedding-001",
+        indexPath: "/tmp/index",
+        currentBranch: "default",
+        baseBranch: "default",
+        compatibility: null,
+        failedBatchesCount: 0,
+        failedBatchesPath: undefined,
+        warning: "Detected a corrupted local SQLite index at /tmp/index/codebase.db and reset the local index. Run index_codebase to rebuild search data.",
+      };
+      const result = formatStatus(status);
+
+      expect(result).toContain("corrupted local SQLite index");
+      expect(result).toContain("Run index_codebase to rebuild search data");
+      expect(result).not.toContain("Codebase is not indexed");
+    });
+
     it("should warn when indexed data exists alongside failed batches", () => {
       const status: StatusResult = {
         indexed: true,

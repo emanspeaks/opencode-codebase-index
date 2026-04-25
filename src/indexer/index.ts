@@ -147,7 +147,10 @@ export interface StatusResult {
   compatibility: IndexCompatibility | null;
   failedBatchesCount: number;
   failedBatchesPath?: string;
+  warning?: string;
 }
+
+const STARTUP_WARNING_METADATA_KEY = "index.startupWarning";
 
 export interface IndexProgress {
   phase: "scanning" | "parsing" | "embedding" | "storing" | "complete";
@@ -2127,7 +2130,12 @@ export class Indexer {
     }
 
     if (shouldRunGc) {
-      await this.healthCheck();
+      const result = await this.healthCheck();
+      if (result.warning) {
+        this.database.setMetadata(STARTUP_WARNING_METADATA_KEY, result.warning);
+      } else {
+        this.database.deleteMetadata(STARTUP_WARNING_METADATA_KEY);
+      }
       this.database.setMetadata("lastGcTimestamp", now.toString());
     }
   }
@@ -3342,7 +3350,7 @@ export class Indexer {
   }
 
   async getStatus(): Promise<StatusResult> {
-    const { store, configuredProviderInfo } = await this.ensureInitialized();
+    const { store, configuredProviderInfo, database } = await this.ensureInitialized();
     const failedBatchesCount = this.getFailedBatchesCount();
 
     return {
@@ -3356,6 +3364,7 @@ export class Indexer {
       compatibility: this.indexCompatibility,
       failedBatchesCount,
       failedBatchesPath: failedBatchesCount > 0 ? this.failedBatchesPath : undefined,
+      warning: database.getMetadata(STARTUP_WARNING_METADATA_KEY) ?? undefined,
     };
   }
 

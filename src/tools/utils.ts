@@ -79,6 +79,10 @@ export function formatIndexStats(stats: IndexStats, verbose: boolean = false): s
 
 export function formatStatus(status: StatusResult): string {
   if (!status.indexed) {
+    if (status.warning) {
+      return status.warning;
+    }
+
     if (status.failedBatchesCount > 0) {
       const lines = [
         "Codebase is not indexed. The last indexing run left failed embedding batches.",
