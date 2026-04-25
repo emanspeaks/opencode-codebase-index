@@ -14,7 +14,7 @@ function loadJsonFile(filePath: string): unknown {
   return null;
 }
 
-function rebasePathEntries(
+export function rebasePathEntries(
   values: unknown,
   fromDir: string,
   toDir: string,
