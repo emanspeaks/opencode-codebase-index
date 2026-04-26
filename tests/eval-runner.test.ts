@@ -325,7 +325,7 @@ describe("eval runner", () => {
 
     expect(localEvalConfig.customProvider?.model).toBe("mock-embedding-model");
     expect(localEvalConfig.additionalInclude).toEqual(["docs/**/*.md"]);
-    expect(localEvalConfig.knowledgeBases).toEqual([path.join("..", "main-repo", "docs", "reference")]);
+    expect(localEvalConfig.knowledgeBases).toEqual(["docs/reference"]);
   });
 
   it("creates a local eval config boundary when reindexing with an explicit config path", async () => {
@@ -432,7 +432,7 @@ describe("eval runner", () => {
 
     expect(localEvalConfig.customProvider?.model).toBe("mock-embedding-model");
     expect(localEvalConfig.additionalInclude).toEqual(["docs/**/*.md"]);
-    expect(localEvalConfig.knowledgeBases).toEqual([path.join("..", "main-repo", "docs", "reference")]);
+    expect(localEvalConfig.knowledgeBases).toEqual(["docs/reference"]);
   });
 
   it("compares against baseline and writes compare artifact", async () => {

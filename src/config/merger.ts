@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import * as os from "os";
 import * as path from "path";
 
@@ -36,6 +36,45 @@ export function rebasePathEntries(
     .filter(Boolean);
 }
 
+function isWithinRoot(rootDir: string, targetPath: string): boolean {
+  const relativePath = path.relative(rootDir, targetPath);
+  return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+export function resolveInheritedKnowledgeBaseEntries(
+  values: unknown,
+  sourceRoot: string,
+  targetRoot: string,
+): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return values
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => {
+      const trimmed = value.trim();
+      if (!trimmed || path.isAbsolute(trimmed)) {
+        return trimmed;
+      }
+
+      const resolvedFromSource = path.resolve(sourceRoot, trimmed);
+      if (isWithinRoot(sourceRoot, resolvedFromSource)) {
+        return path.normalize(trimmed);
+      }
+
+      return path.normalize(path.relative(targetRoot, resolvedFromSource));
+    })
+    .filter(Boolean);
+}
+
+export function materializeLocalProjectConfig(projectRoot: string, config: unknown): string {
+  const localConfigPath = path.join(projectRoot, ".opencode", "codebase-index.json");
+  mkdirSync(path.dirname(localConfigPath), { recursive: true });
+  writeFileSync(localConfigPath, JSON.stringify(config, null, 2), "utf-8");
+  return localConfigPath;
+}
+
 /**
  * Loads and merges global and project configs.
  * 
@@ -66,7 +105,7 @@ export function loadMergedConfig(projectRoot: string): unknown {
   // If only project exists, return it
   if (!globalConfig && projectConfig) {
     if (Array.isArray(projectConfig.knowledgeBases)) {
-      projectConfig.knowledgeBases = rebasePathEntries(projectConfig.knowledgeBases, projectConfigBaseDir, projectRoot);
+      projectConfig.knowledgeBases = resolveInheritedKnowledgeBaseEntries(projectConfig.knowledgeBases, projectConfigBaseDir, projectRoot);
     }
     return projectConfig;
   }
@@ -170,7 +209,7 @@ export function loadMergedConfig(projectRoot: string): unknown {
   // For knowledgeBases: merge arrays (union, deduplicated)
   const globalKbs = globalConfig && Array.isArray(globalConfig.knowledgeBases) ? globalConfig.knowledgeBases : [];
   const projectKbs = projectConfig
-    ? rebasePathEntries(projectConfig.knowledgeBases, projectConfigBaseDir, projectRoot)
+    ? resolveInheritedKnowledgeBaseEntries(projectConfig.knowledgeBases, projectConfigBaseDir, projectRoot)
     : [];
   const allKbs = [...globalKbs, ...projectKbs];
   const uniqueKbs = [...new Set(allKbs.map(p => String(p).trim()))];

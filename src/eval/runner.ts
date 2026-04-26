@@ -7,7 +7,7 @@ import * as os from "os";
 import * as path from "path";
 import { performance } from "perf_hooks";
 
-import { rebasePathEntries } from "../config/merger.js";
+import { resolveInheritedKnowledgeBaseEntries } from "../config/merger.js";
 import { parseConfig } from "../config/schema.js";
 import type { SearchConfig as ConfigSearchConfig } from "../config/schema.js";
 import { getDefaultModelForProvider } from "../config/index.js";
@@ -100,7 +100,7 @@ function ensureLocalEvalProjectConfig(projectRoot: string, configPath?: string):
   const sourceConfigBaseDir = path.dirname(path.dirname(resolvedConfigPath));
 
   if (Array.isArray(sourceConfig.knowledgeBases)) {
-    sourceConfig.knowledgeBases = rebasePathEntries(
+    sourceConfig.knowledgeBases = resolveInheritedKnowledgeBaseEntries(
       sourceConfig.knowledgeBases,
       sourceConfigBaseDir,
       projectRoot,
