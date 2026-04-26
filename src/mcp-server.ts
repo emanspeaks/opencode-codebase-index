@@ -1,8 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import * as path from "path";
 
 import { Indexer } from "./indexer/index.js";
 import type { ParsedCodebaseIndexConfig, LogLevel } from "./config/schema.js";
+import { loadMergedConfig, materializeLocalProjectConfig } from "./config/merger.js";
 import { formatDefinitionLookup, formatIndexStats, formatStatus } from "./tools/utils.js";
 import { formatCostEstimate } from "./utils/cost.js";
 import type { LogEntry } from "./utils/logger.js";
@@ -29,8 +31,14 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
     version: "0.5.1",
   });
 
-  const indexer = new Indexer(projectRoot, config);
+  let runtimeConfig = config;
+  let indexer = new Indexer(projectRoot, runtimeConfig);
   let initialized = false;
+
+  function refreshIndexerFromConfig(): void {
+    indexer = new Indexer(projectRoot, runtimeConfig);
+    initialized = false;
+  }
 
   async function ensureInitialized(): Promise<void> {
     if (!initialized) {
@@ -126,6 +134,13 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
       }
 
       if (args.force) {
+        const status = await indexer.getStatus();
+        const localIndexPath = path.join(projectRoot, ".opencode", "index");
+        if (runtimeConfig.scope === "project" && path.resolve(status.indexPath) !== path.resolve(localIndexPath)) {
+          materializeLocalProjectConfig(projectRoot, loadMergedConfig(projectRoot));
+          refreshIndexerFromConfig();
+          await ensureInitialized();
+        }
         await indexer.clearIndex();
       }
 

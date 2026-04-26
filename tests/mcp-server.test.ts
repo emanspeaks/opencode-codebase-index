@@ -4,6 +4,17 @@ import { parseConfig } from "../src/config/schema.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
+const mergerMocks = vi.hoisted(() => ({
+  loadMergedConfig: vi.fn(() => ({})),
+  materializeLocalProjectConfig: vi.fn(),
+}));
+
+const indexerMockState = vi.hoisted(() => ({
+  constructorArgs: [] as Array<[string, unknown]>,
+}));
+
+vi.mock("../src/config/merger.js", () => mergerMocks);
+
 let mockIndexResult = {
   totalFiles: 10,
   totalChunks: 50,
@@ -33,6 +44,10 @@ let mockStatusResult = {
 
 vi.mock("../src/indexer/index.js", () => {
   class MockIndexer {
+    constructor(projectRoot: string, config: unknown) {
+      indexerMockState.constructorArgs.push([projectRoot, config]);
+    }
+
     initialize = vi.fn().mockResolvedValue(undefined);
     search = vi.fn().mockResolvedValue([
       {
@@ -112,6 +127,10 @@ describe("MCP server tools and prompts", () => {
   let server: ReturnType<typeof createMcpServer>;
 
   beforeEach(async () => {
+    indexerMockState.constructorArgs.length = 0;
+    mergerMocks.loadMergedConfig.mockReset();
+    mergerMocks.loadMergedConfig.mockReturnValue({});
+    mergerMocks.materializeLocalProjectConfig.mockReset();
     mockIndexResult = {
       totalFiles: 10,
       totalChunks: 50,
@@ -288,6 +307,58 @@ describe("MCP server tools and prompts", () => {
     expect(content).toHaveLength(1);
     expect(content[0].type).toBe("text");
     expect(content[0].text).toContain("Estimate");
+  });
+
+  it("should preserve runtime config on force refresh after localizing inherited project state", async () => {
+    mockStatusResult = {
+      ...mockStatusResult,
+      indexPath: "/tmp/shared-index",
+    };
+    mergerMocks.loadMergedConfig.mockReturnValue({
+      embeddingProvider: "openai",
+      customProvider: {
+        baseUrl: "https://disk.example.com/v1",
+        model: "disk-model",
+        dimensions: 1536,
+        apiKey: "disk-key",
+      },
+    });
+
+    const runtimeConfig = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "https://runtime.example.com/v1",
+        model: "runtime-model",
+        dimensions: 1024,
+        apiKey: "runtime-key",
+      },
+      scope: "project",
+    });
+    server = createMcpServer("/tmp/test-project", runtimeConfig);
+    client = new Client({ name: "test-client", version: "1.0.0" });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const result = await client.callTool({
+      name: "index_codebase",
+      arguments: { force: true },
+    });
+
+    expect(result.content).toBeDefined();
+    expect(mergerMocks.materializeLocalProjectConfig).toHaveBeenCalledWith(
+      "/tmp/test-project",
+      mergerMocks.loadMergedConfig.mock.results.at(-1)?.value,
+    );
+
+    expect(indexerMockState.constructorArgs.length).toBeGreaterThanOrEqual(3);
+    expect(indexerMockState.constructorArgs.slice(-2)).toEqual([
+      ["/tmp/test-project", runtimeConfig],
+      ["/tmp/test-project", runtimeConfig],
+    ]);
   });
 
   it("should execute index_health_check tool", async () => {
