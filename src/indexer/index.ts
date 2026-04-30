@@ -208,6 +208,11 @@ interface FailedBatch {
   lastAttempt: string;
 }
 
+interface RetryableFailedChunk {
+  chunk: PendingChunk;
+  attemptCount: number;
+}
+
 interface SerializedFailedBatch {
   chunks: unknown[];
   error: string;
@@ -390,6 +395,41 @@ function createPendingEmbeddingRequests(chunks: PendingChunk[]): PendingEmbeddin
       tokenCount: textPart.tokenCount,
     }))
   );
+}
+
+function createPendingEmbeddingRequestBatches(
+  chunks: PendingChunk[],
+  options: { maxBatchTokens?: number; maxBatchItems?: number } = {}
+): PendingEmbeddingRequest[][] {
+  return createDynamicBatches(createPendingEmbeddingRequests(chunks), options);
+}
+
+function getUniquePendingChunksFromRequests(requests: PendingEmbeddingRequest[]): PendingChunk[] {
+  const uniqueChunks = new Map<string, PendingChunk>();
+  for (const request of requests) {
+    uniqueChunks.set(request.chunk.id, request.chunk);
+  }
+  return Array.from(uniqueChunks.values());
+}
+
+function coalesceFailedBatches(batches: FailedBatch[]): FailedBatch[] {
+  const grouped = new Map<string, FailedBatch>();
+
+  for (const batch of batches) {
+    const key = `${batch.attemptCount}:${batch.lastAttempt}:${batch.error}`;
+    const existing = grouped.get(key);
+    if (!existing) {
+      grouped.set(key, {
+        ...batch,
+        chunks: [...batch.chunks],
+      });
+      continue;
+    }
+
+    existing.chunks.push(...batch.chunks);
+  }
+
+  return Array.from(grouped.values());
 }
 
 function poolEmbeddingVectors(vectors: number[][], weights: number[]): number[] {
@@ -2098,8 +2138,8 @@ export class Indexer {
     currentFileHashes: Map<string, string>,
     unchangedFilePaths: Set<string>,
     maxChunkTokens?: number
-  ): PendingChunk[] {
-    const retryableById = new Map<string, PendingChunk>();
+  ): RetryableFailedChunk[] {
+    const retryableById = new Map<string, RetryableFailedChunk>();
 
     for (const batch of this.loadFailedBatches(maxChunkTokens)) {
       for (const chunk of batch.chunks) {
@@ -2110,7 +2150,14 @@ export class Indexer {
         if (!unchangedFilePaths.has(filePath)) {
           continue;
         }
-        retryableById.set(chunk.id, chunk);
+
+        const existing = retryableById.get(chunk.id);
+        if (!existing || batch.attemptCount > existing.attemptCount) {
+          retryableById.set(chunk.id, {
+            chunk,
+            attemptCount: batch.attemptCount,
+          });
+        }
       }
     }
 
@@ -2957,9 +3004,11 @@ export class Indexer {
       unchangedFilePaths,
       getSafeEmbeddingChunkTokenLimit(configuredProviderInfo)
     );
+    const retryableFailedAttemptCounts = new Map<string, number>();
     if (retryableFailedChunks.length > 0) {
       const pendingChunkIds = new Set(pendingChunks.map((chunk) => chunk.id));
-      for (const chunk of retryableFailedChunks) {
+      for (const { chunk, attemptCount } of retryableFailedChunks) {
+        retryableFailedAttemptCounts.set(chunk.id, attemptCount);
         if (!pendingChunkIds.has(chunk.id)) {
           pendingChunks.push(chunk);
           pendingChunkIds.add(chunk.id);
@@ -3188,27 +3237,26 @@ export class Indexer {
       interval: providerRateLimits.intervalMs,
       intervalCap: providerRateLimits.concurrency
     });
-    const dynamicBatches = createDynamicBatches(
-      chunksNeedingEmbedding.map((chunk) => ({
-        ...chunk,
-        text: chunk.storageText,
-        tokenCount: chunk.texts.reduce((sum, textPart) => sum + textPart.tokenCount, 0),
-      })),
+    const pendingChunksById = new Map(chunksNeedingEmbedding.map((chunk) => [chunk.id, chunk]));
+    const embeddingPartsByChunk = new Map<string, Array<{ vector: number[]; tokenCount: number } | undefined>>();
+    const completedChunkIds = new Set<string>();
+    const failedChunkIds = new Set<string>();
+    const requestBatches = createPendingEmbeddingRequestBatches(
+      chunksNeedingEmbedding,
       getDynamicBatchOptions(configuredProviderInfo)
     );
     let rateLimitBackoffMs = 0;
 
-    for (const batch of dynamicBatches) {
+    for (const requestBatch of requestBatches) {
       queue.add(async () => {
         if (rateLimitBackoffMs > 0) {
           await new Promise(resolve => setTimeout(resolve, rateLimitBackoffMs));
         }
 
         try {
-          const requests = createPendingEmbeddingRequests(batch);
           const result = await pRetry(
             async () => {
-              const texts = requests.map((request) => request.text);
+              const texts = requestBatch.map((request) => request.text);
               return provider.embedBatch(texts);
             },
             {
@@ -3240,9 +3288,13 @@ export class Indexer {
             rateLimitBackoffMs = Math.max(0, rateLimitBackoffMs - 2000);
           }
 
-          const embeddingPartsByChunk = new Map<string, Array<{ vector: number[]; tokenCount: number }>>();
+          const touchedChunkIds = new Set<string>();
 
-          requests.forEach((request, idx) => {
+          requestBatch.forEach((request, idx) => {
+            if (failedChunkIds.has(request.chunk.id) || completedChunkIds.has(request.chunk.id)) {
+              return;
+            }
+
             const vector = result.embeddings[idx];
             if (!vector) {
               throw new Error(`Embedding API returned too few vectors for chunk ${request.chunk.id}`);
@@ -3254,54 +3306,69 @@ export class Indexer {
               tokenCount: request.tokenCount,
             };
             embeddingPartsByChunk.set(request.chunk.id, parts);
+            touchedChunkIds.add(request.chunk.id);
           });
 
-          const uniqueChunks = batch;
-          const pooledResults = uniqueChunks.map((chunk) => {
+          const pooledResults: Array<{ chunk: PendingChunk; vector: number[] }> = [];
+          for (const chunkId of touchedChunkIds) {
+            if (failedChunkIds.has(chunkId) || completedChunkIds.has(chunkId)) {
+              continue;
+            }
+
+            const chunk = pendingChunksById.get(chunkId);
+            if (!chunk) {
+              continue;
+            }
+
             const parts = embeddingPartsByChunk.get(chunk.id) ?? [];
             if (parts.length !== chunk.texts.length || parts.some((part) => !part)) {
-              throw new Error(`Embedding API returned incomplete pooled parts for chunk ${chunk.id}`);
+              continue;
             }
 
             const orderedParts = parts as Array<{ vector: number[]; tokenCount: number }>;
-            return {
+            pooledResults.push({
               chunk,
               vector: poolEmbeddingVectors(
                 orderedParts.map((part) => part.vector),
                 orderedParts.map((part) => part.tokenCount)
               ),
-            };
-          });
-
-          const items = pooledResults.map(({ chunk, vector }) => ({
-            id: chunk.id,
-            vector,
-            metadata: chunk.metadata,
-          }));
-
-          store.addBatch(items);
-
-          const embeddingBatchItems = pooledResults.map(({ chunk, vector }) => ({
-            contentHash: chunk.contentHash,
-            embedding: float32ArrayToBuffer(vector),
-            chunkText: chunk.storageText,
-            model: configuredProviderInfo.modelInfo.model,
-          }));
-          database.upsertEmbeddingsBatch(embeddingBatchItems);
-
-          for (const chunk of uniqueChunks) {
-            invertedIndex.removeChunk(chunk.id);
-            invertedIndex.addChunk(chunk.id, chunk.content);
+            });
           }
 
-          stats.indexedChunks += uniqueChunks.length;
+          if (pooledResults.length > 0) {
+            const items = pooledResults.map(({ chunk, vector }) => ({
+              id: chunk.id,
+              vector,
+              metadata: chunk.metadata,
+            }));
+
+            store.addBatch(items);
+
+            const embeddingBatchItems = pooledResults.map(({ chunk, vector }) => ({
+              contentHash: chunk.contentHash,
+              embedding: float32ArrayToBuffer(vector),
+              chunkText: chunk.storageText,
+              model: configuredProviderInfo.modelInfo.model,
+            }));
+            database.upsertEmbeddingsBatch(embeddingBatchItems);
+
+            for (const { chunk } of pooledResults) {
+              invertedIndex.removeChunk(chunk.id);
+              invertedIndex.addChunk(chunk.id, chunk.content);
+              completedChunkIds.add(chunk.id);
+              embeddingPartsByChunk.delete(chunk.id);
+            }
+
+            stats.indexedChunks += pooledResults.length;
+            this.logger.recordChunksEmbedded(pooledResults.length);
+          }
+
           stats.tokensUsed += result.totalTokensUsed;
 
-          this.logger.recordChunksEmbedded(uniqueChunks.length);
           this.logger.recordEmbeddingApiCall(result.totalTokensUsed);
           this.logger.embedding("debug", `Embedded batch`, {
-            batchSize: uniqueChunks.length,
-            requestCount: requests.length,
+            batchSize: pooledResults.length,
+            requestCount: requestBatch.length,
             tokens: result.totalTokensUsed,
           });
 
@@ -3313,24 +3380,48 @@ export class Indexer {
             totalChunks: pendingChunks.length,
           });
         } catch (error) {
-          const failedChunks = batch;
-          stats.failedChunks += failedChunks.length;
-          if (forceScopedReembed) {
-            for (const chunk of failedChunks) {
+          const failedChunks = getUniquePendingChunksFromRequests(requestBatch)
+            .filter((chunk) => !completedChunkIds.has(chunk.id));
+          const failureMessage = getErrorMessage(error);
+          const failureTimestamp = new Date().toISOString();
+
+          for (const chunk of failedChunks) {
+            if (!failedChunkIds.has(chunk.id)) {
+              failedChunkIds.add(chunk.id);
+              stats.failedChunks += 1;
+            }
+
+            if (forceScopedReembed) {
               failedForcedChunkIds.add(chunk.id);
             }
+
+            embeddingPartsByChunk.delete(chunk.id);
+
+            const existingFailedBatchIndex = failedBatchesForCurrentRun.findIndex(
+              (failedBatch) => failedBatch.chunks[0]?.id === chunk.id
+            );
+            const existingFailedBatch = existingFailedBatchIndex === -1
+              ? undefined
+              : failedBatchesForCurrentRun[existingFailedBatchIndex];
+            const failedBatch = {
+              chunks: [chunk],
+              error: failureMessage,
+              attemptCount: (existingFailedBatch?.attemptCount ?? retryableFailedAttemptCounts.get(chunk.id) ?? 0) + 1,
+              lastAttempt: failureTimestamp,
+            } satisfies FailedBatch;
+
+            if (existingFailedBatchIndex === -1) {
+              failedBatchesForCurrentRun.push(failedBatch);
+            } else {
+              failedBatchesForCurrentRun[existingFailedBatchIndex] = failedBatch;
+            }
           }
-          failedBatchesForCurrentRun.push({
-            chunks: failedChunks,
-            error: getErrorMessage(error),
-            attemptCount: 1,
-            lastAttempt: new Date().toISOString(),
-          });
+
           this.logger.recordEmbeddingError();
           this.logger.embedding("error", `Failed to embed batch after retries`, {
             batchSize: failedChunks.length,
-            requestCount: failedChunks.reduce((sum, chunk) => sum + chunk.texts.length, 0),
-            error: getErrorMessage(error),
+            requestCount: requestBatch.length,
+            error: failureMessage,
           });
         }
       });
@@ -3338,9 +3429,9 @@ export class Indexer {
 
     await queue.onIdle();
     if (scopedRoots) {
-      this.saveScopedFailedBatches(failedBatchesForCurrentRun, scopedRoots);
+      this.saveScopedFailedBatches(coalesceFailedBatches(failedBatchesForCurrentRun), scopedRoots);
     } else {
-      this.saveFailedBatches(failedBatchesForCurrentRun);
+      this.saveFailedBatches(coalesceFailedBatches(failedBatchesForCurrentRun));
     }
 
     onProgress?.({
@@ -4011,92 +4102,161 @@ export class Indexer {
     const stillFailing: FailedBatch[] = [];
 
     for (const batch of failedBatches) {
+      const batchChunksById = new Map(batch.chunks.map((chunk) => [chunk.id, chunk]));
+      const embeddingPartsByChunk = new Map<string, Array<{ vector: number[]; tokenCount: number } | undefined>>();
+      const completedChunkIds = new Set<string>();
+      const failedChunkIds = new Set<string>();
+      const failedChunksForBatch = new Map<string, FailedBatch>();
+      const pooledResults: Array<{ chunk: PendingChunk; vector: number[] }> = [];
       try {
-        const requests = createPendingEmbeddingRequests(batch.chunks);
-        const result = await pRetry(
-          async () => {
-            const texts = requests.map((request) => request.text);
-            return provider.embedBatch(texts);
-          },
-          {
-            retries: this.config.indexing.retries,
-            minTimeout: this.config.indexing.retryDelayMs,
-          }
+        const requestBatches = createPendingEmbeddingRequestBatches(
+          batch.chunks,
+          getDynamicBatchOptions(configuredProviderInfo)
         );
 
-        const embeddingPartsByChunk = new Map<string, Array<{ vector: number[]; tokenCount: number }>>();
-        requests.forEach((request, idx) => {
-          const vector = result.embeddings[idx];
-          if (!vector) {
-            throw new Error(`Embedding API returned too few vectors for chunk ${request.chunk.id}`);
+        for (const requestBatch of requestBatches) {
+          try {
+            const result = await pRetry(
+              async () => {
+                const texts = requestBatch.map((request) => request.text);
+                return provider.embedBatch(texts);
+              },
+              {
+                retries: this.config.indexing.retries,
+                minTimeout: this.config.indexing.retryDelayMs,
+              }
+            );
+
+            const touchedChunkIds = new Set<string>();
+            requestBatch.forEach((request, idx) => {
+              if (failedChunkIds.has(request.chunk.id) || completedChunkIds.has(request.chunk.id)) {
+                return;
+              }
+
+              const vector = result.embeddings[idx];
+              if (!vector) {
+                throw new Error(`Embedding API returned too few vectors for chunk ${request.chunk.id}`);
+              }
+
+              const parts = embeddingPartsByChunk.get(request.chunk.id) ?? [];
+              parts[request.partIndex] = {
+                vector,
+                tokenCount: request.tokenCount,
+              };
+              embeddingPartsByChunk.set(request.chunk.id, parts);
+              touchedChunkIds.add(request.chunk.id);
+            });
+
+            for (const chunkId of touchedChunkIds) {
+              if (failedChunkIds.has(chunkId) || completedChunkIds.has(chunkId)) {
+                continue;
+              }
+
+              const chunk = batchChunksById.get(chunkId);
+              if (!chunk) {
+                continue;
+              }
+
+              const parts = embeddingPartsByChunk.get(chunk.id) ?? [];
+              if (parts.length !== chunk.texts.length || parts.some((part) => !part)) {
+                continue;
+              }
+
+              const orderedParts = parts as Array<{ vector: number[]; tokenCount: number }>;
+              pooledResults.push({
+                chunk,
+                vector: poolEmbeddingVectors(
+                  orderedParts.map((part) => part.vector),
+                  orderedParts.map((part) => part.tokenCount)
+                ),
+              });
+            }
+
+            this.logger.recordEmbeddingApiCall(result.totalTokensUsed);
+          } catch (error) {
+            const failureMessage = String(error);
+            const failureTimestamp = new Date().toISOString();
+            const failedChunks = getUniquePendingChunksFromRequests(requestBatch)
+              .filter((chunk) => !completedChunkIds.has(chunk.id) && !failedChunkIds.has(chunk.id));
+
+            for (const chunk of failedChunks) {
+              failedChunkIds.add(chunk.id);
+              embeddingPartsByChunk.delete(chunk.id);
+              failedChunksForBatch.set(chunk.id, {
+                chunks: [chunk],
+                attemptCount: batch.attemptCount + 1,
+                lastAttempt: failureTimestamp,
+                error: failureMessage,
+              });
+            }
+
+            failed += failedChunks.length;
+            this.logger.recordEmbeddingError();
           }
+        }
 
-          const parts = embeddingPartsByChunk.get(request.chunk.id) ?? [];
-          parts[request.partIndex] = {
-            vector,
-            tokenCount: request.tokenCount,
-          };
-          embeddingPartsByChunk.set(request.chunk.id, parts);
-        });
+        const successfulResults = pooledResults.filter(({ chunk }) => !failedChunkIds.has(chunk.id));
 
-        const pooledResults = batch.chunks.map((chunk) => {
-          const parts = embeddingPartsByChunk.get(chunk.id) ?? [];
-          if (parts.length !== chunk.texts.length || parts.some((part) => !part)) {
-            throw new Error(`Embedding API returned incomplete pooled parts for chunk ${chunk.id}`);
-          }
-
-          const orderedParts = parts as Array<{ vector: number[]; tokenCount: number }>;
-          return {
-            chunk,
-            vector: poolEmbeddingVectors(
-              orderedParts.map((part) => part.vector),
-              orderedParts.map((part) => part.tokenCount)
-            ),
-          };
-        });
-
-        const items = pooledResults.map(({ chunk, vector }) => ({
+        const items = successfulResults.map(({ chunk, vector }) => ({
           id: chunk.id,
           vector,
           metadata: chunk.metadata,
         }));
 
-        store.addBatch(items);
-
-        database.upsertEmbeddingsBatch(
-          pooledResults.map(({ chunk, vector }) => ({
-            contentHash: chunk.contentHash,
-            embedding: float32ArrayToBuffer(vector),
-            chunkText: chunk.storageText,
-            model: configuredProviderInfo.modelInfo.model,
-          }))
-        );
-
-        for (const chunk of batch.chunks) {
-          invertedIndex.removeChunk(chunk.id);
-          invertedIndex.addChunk(chunk.id, chunk.content);
+        if (items.length > 0) {
+          store.addBatch(items);
         }
 
-        this.logger.recordChunksEmbedded(batch.chunks.length);
-        this.logger.recordEmbeddingApiCall(result.totalTokensUsed);
+        if (successfulResults.length > 0) {
+          database.upsertEmbeddingsBatch(
+            successfulResults.map(({ chunk, vector }) => ({
+              contentHash: chunk.contentHash,
+              embedding: float32ArrayToBuffer(vector),
+              chunkText: chunk.storageText,
+              model: configuredProviderInfo.modelInfo.model,
+            }))
+          );
+        }
 
-        succeeded += batch.chunks.length;
+        for (const { chunk } of successfulResults) {
+          invertedIndex.removeChunk(chunk.id);
+          invertedIndex.addChunk(chunk.id, chunk.content);
+          completedChunkIds.add(chunk.id);
+          embeddingPartsByChunk.delete(chunk.id);
+        }
+
+        this.logger.recordChunksEmbedded(successfulResults.length);
+
+        succeeded += successfulResults.length;
+        stillFailing.push(...failedChunksForBatch.values());
       } catch (error) {
-        failed += batch.chunks.length;
+        const failureMessage = getErrorMessage(error);
+        const failureTimestamp = new Date().toISOString();
+        const unaccountedChunks = batch.chunks.filter(
+          (chunk) => !failedChunksForBatch.has(chunk.id) && !completedChunkIds.has(chunk.id)
+        );
+
+        for (const chunk of unaccountedChunks) {
+          failedChunksForBatch.set(chunk.id, {
+            chunks: [chunk],
+            attemptCount: batch.attemptCount + 1,
+            lastAttempt: failureTimestamp,
+            error: failureMessage,
+          });
+        }
+
+        failed += unaccountedChunks.length;
         this.logger.recordEmbeddingError();
-        stillFailing.push({
-          ...batch,
-          attemptCount: batch.attemptCount + 1,
-          lastAttempt: new Date().toISOString(),
-          error: String(error),
-        });
+        stillFailing.push(...coalesceFailedBatches(Array.from(failedChunksForBatch.values())));
       }
     }
 
+    const persistedStillFailing = coalesceFailedBatches(stillFailing);
+
     if (roots) {
-      this.saveFailedBatches([...retainedFailedBatches, ...stillFailing]);
+      this.saveFailedBatches([...retainedFailedBatches, ...persistedStillFailing]);
     } else {
-      this.saveFailedBatches(stillFailing);
+      this.saveFailedBatches(persistedStillFailing);
     }
 
     if (succeeded > 0) {
@@ -4104,7 +4264,7 @@ export class Indexer {
       invertedIndex.save();
     }
 
-    return { succeeded, failed, remaining: stillFailing.length };
+    return { succeeded, failed, remaining: persistedStillFailing.length };
   }
 
   getFailedBatchesCount(): number {
