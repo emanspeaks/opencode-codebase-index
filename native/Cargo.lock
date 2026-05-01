@@ -115,6 +115,7 @@ dependencies = [
  "tree-sitter-c",
  "tree-sitter-c-sharp",
  "tree-sitter-cpp",
+ "tree-sitter-fortran",
  "tree-sitter-go",
  "tree-sitter-java",
  "tree-sitter-javascript",
@@ -821,6 +822,16 @@ name = "tree-sitter-cpp"
 version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-fortran"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50d655214a848bfb63dfdc2e7eeef5c3c323807a220b3117a1aef46b2bb95a12"
 dependencies = [
  "cc",
  "tree-sitter-language",

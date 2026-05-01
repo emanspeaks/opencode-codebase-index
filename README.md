@@ -211,7 +211,7 @@ graph TD
 
 1. **Parsing**: We use `tree-sitter` to intelligently parse your code into meaningful blocks (functions, classes, interfaces). JSDoc comments and docstrings are automatically included with their associated code.
 
-**Supported Languages (Tree-sitter semantic parsing)**: TypeScript, JavaScript, Python, Rust, Go, Java, C#, Ruby, PHP, Apex, Bash, C, C++, JSON, TOML, YAML
+**Supported Languages (Tree-sitter semantic parsing)**: TypeScript, JavaScript, Python, Rust, Go, Java, C#, Ruby, PHP, Apex, Bash, C, C++, JSON, TOML, YAML, Fortran
 
 **Additional Supported Formats (line-based chunking)**: TXT, HTML, HTM, Markdown, Shell scripts
 
@@ -223,6 +223,7 @@ graph TD
 **/*.{sql,graphql,proto}        **/*.{yaml,yml,toml}
 **/*.{md,mdx}                   **/*.{sh,bash,zsh}
 **/*.{txt,html,htm}              **/*.{cls,trigger}
+**/*.{f90,f95,f03,f08,f,for,f77}
 ```
 
 Use `include` to replace defaults, or `additionalInclude` to extend (e.g. `"**/*.pdf"`, `"**/*.csv"`).
@@ -351,7 +352,9 @@ Returns recent debug logs with optional filtering.
 - **Parameters**: `category` (optional: `search`, `embedding`, `cache`, `gc`, `branch`), `level` (optional: `error`, `warn`, `info`, `debug`), `limit` (default: 50).
 
 ### `call_graph`
-Query the call graph to find callers or callees of a function/method. Automatically built during indexing for TypeScript, JavaScript, Python, Go, and Rust.
+
+Query the call graph to find callers or callees of a function/method. Automatically built during indexing for TypeScript, JavaScript, Python, Go, Rust, PHP, and Fortran.
+
 - **Use for**: Understanding code flow, tracing dependencies, impact analysis.
 - **Parameters**: `name` (function name), `direction` (`callers` or `callees`), `symbolId` (required for `callees`, returned by previous queries).
 - **Example**: Find who calls `validateToken` → `call_graph(name="validateToken", direction="callers")`
@@ -1000,7 +1003,7 @@ The Rust native module handles performance-critical operations:
 - **usearch**: High-performance vector similarity search with F16 quantization
 - **SQLite**: Persistent storage for embeddings, chunks, branch catalog, symbols, and call edges
 - **BM25 inverted index**: Fast keyword search for hybrid retrieval
-- **Call graph extraction**: Tree-sitter query-based extraction of function calls, method calls, constructors, and imports (TypeScript/JavaScript, Python, Go, Rust)
+- **Call graph extraction**: Tree-sitter query-based extraction of function calls, method calls, constructors, and imports (TypeScript/JavaScript, Python, Go, Rust, PHP, Fortran)
 - **xxhash**: Fast content hashing for change detection
 
 Rebuild with: `npm run build:native` (requires Rust toolchain)

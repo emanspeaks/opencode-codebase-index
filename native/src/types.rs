@@ -33,6 +33,7 @@ pub enum Language {
     Html,
     Php,
     Apex,
+    Fortran,
     Text,
 }
 
@@ -59,6 +60,7 @@ impl Language {
             "html" | "htm" => Language::Html,
             "txt" => Language::Text,
             "php" | "inc" => Language::Php,
+            "f90" | "f95" | "f03" | "f08" | "f" | "for" | "f77" => Language::Fortran,
             "cls" | "trigger" => Language::Apex,
             _ => Language::Text,
         }
@@ -85,6 +87,7 @@ impl Language {
             Language::Markdown => "markdown",
             Language::Html => "html",
             Language::Php => "php",
+            Language::Fortran => "fortran",
             Language::Apex => "apex",
             Language::Text => "text",
         }
@@ -112,6 +115,7 @@ impl Language {
             "html" | "htm" => Language::Html,
             "text" | "txt" => Language::Text,
             "php" => Language::Php,
+            "fortran" => Language::Fortran,
             "apex" => Language::Apex,
             _ => Language::Text,
         }

@@ -11,6 +11,7 @@ export const DEFAULT_INCLUDE = [
   "**/*.{md,mdx}",
   "**/*.{sh,bash,zsh}",
   "**/*.{txt,html,htm}",
+  "**/*.{f90,f95,f03,f08,f,for,f77}",
 ];
 
 export const DEFAULT_EXCLUDE = [

@@ -231,6 +231,35 @@ public class AccountService {
       // Language label is consistent.
       expect(chunks.every((c) => c.language === "apex")).toBe(true);
     });
+
+    it("should parse Fortran files", () => {
+      const content = `
+module geometry
+  implicit none
+
+  type :: point
+    real :: x, y
+  end type point
+
+contains
+
+  subroutine print_point(p)
+    type(point), intent(in) :: p
+    print *, 'x =', p%x, 'y =', p%y
+  end subroutine print_point
+
+  real function distance(a, b)
+    type(point), intent(in) :: a, b
+    distance = sqrt((a%x - b%x)**2 + (a%y - b%y)**2)
+  end function distance
+
+end module geometry
+`;
+      const chunks = parseFile("geometry.f90", content);
+
+      expect(chunks.length).toBeGreaterThanOrEqual(1);
+      expect(chunks.some((c) => c.content.includes("subroutine print_point") || c.content.includes("module geometry"))).toBe(true);
+    });
   });
 
   describe("parseFiles", () => {

@@ -506,6 +506,56 @@ describe("call-graph", () => {
       expect(callees[0].isResolved).toBe(true);
       expect(callees[0].toSymbolId).toBe("sym_case_target");
     });
+
+    describe("fortran call extraction", () => {
+      it("should extract subroutine calls", () => {
+        const content = `
+program main
+  implicit none
+  call greet("World")
+  call compute(1.0, 2.0)
+end program main
+
+subroutine greet(name)
+  character(len=*), intent(in) :: name
+  print *, "Hello, ", name
+end subroutine greet
+
+subroutine compute(a, b)
+  real, intent(in) :: a, b
+  real :: result
+  result = a + b
+  print *, result
+end subroutine compute
+`;
+        const calls = extractCalls(content, "fortran");
+
+        const callNames = calls.map((c) => c.calleeName);
+        expect(callNames).toContain("greet");
+        expect(callNames).toContain("compute");
+
+        const greetCall = calls.find((c) => c.calleeName === "greet");
+        expect(greetCall).toBeDefined();
+        expect(greetCall!.callType).toBe("Call");
+      });
+
+      it("should extract USE module imports", () => {
+        const content = `
+program main
+  use geometry
+  use math_utils
+  implicit none
+  print *, "hello"
+end program main
+`;
+        const calls = extractCalls(content, "fortran");
+
+        const importCalls = calls.filter((c) => c.callType === "Import");
+        const importNames = importCalls.map((c) => c.calleeName);
+        expect(importNames).toContain("geometry");
+        expect(importNames).toContain("math_utils");
+      });
+    });
   });
 
   describe("call graph storage", () => {
