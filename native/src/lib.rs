@@ -1194,4 +1194,5 @@ impl Database {
             db::gc_orphan_call_edges(&conn).map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(count as u32)
     }
+
 }
