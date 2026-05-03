@@ -684,26 +684,50 @@ export class PgDatabaseBackend implements IDatabaseBackend {
 
       // ── Migrations for existing databases ────────────────────────
       // Add source_id columns to tables that may have been created before
-      // this schema version.  All are idempotent (IF NOT EXISTS / IF EXISTS).
+      // this schema version.  ADD COLUMN IF NOT EXISTS is idempotent.
       await client.query(`ALTER TABLE ${this.t("chunks")}        ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
       await client.query(`ALTER TABLE ${this.t("symbols")}       ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
       await client.query(`ALTER TABLE ${this.t("call_edges")}    ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
 
+      // For tables whose PK must gain a source_id prefix, only run the
+      // DROP+ADD when source_id is not yet part of the primary key —
+      // avoids an ACCESS EXCLUSIVE lock on every startup.
+      const pkNeedsMigration = async (table: string): Promise<boolean> => {
+        const { rows } = await client.query<{ exists: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1
+             FROM   pg_index     i
+             JOIN   pg_attribute a ON a.attrelid = i.indrelid
+                                  AND a.attnum   = ANY(i.indkey)
+             WHERE  i.indrelid  = $1::regclass
+               AND  i.indisprimary
+               AND  a.attname   = 'source_id'
+           ) AS exists`,
+          [table]
+        );
+        return !rows[0]!.exists;
+      };
+
       // branch_chunks: old PK was (branch, chunk_id); new PK is (source_id, branch, chunk_id).
-      // Drop old PK, add source_id column, add new PK.
       await client.query(`ALTER TABLE ${this.t("branch_chunks")} ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
-      await client.query(`ALTER TABLE ${this.t("branch_chunks")} DROP CONSTRAINT IF EXISTS ${this.t("branch_chunks_pkey")}`);
-      await client.query(`ALTER TABLE ${this.t("branch_chunks")} ADD PRIMARY KEY (source_id, branch, chunk_id)`);
+      if (await pkNeedsMigration(this.t("branch_chunks"))) {
+        await client.query(`ALTER TABLE ${this.t("branch_chunks")} DROP CONSTRAINT IF EXISTS ${this.t("branch_chunks_pkey")}`);
+        await client.query(`ALTER TABLE ${this.t("branch_chunks")} ADD PRIMARY KEY (source_id, branch, chunk_id)`);
+      }
 
       // branch_symbols: old PK was (branch, symbol_id); new PK is (source_id, branch, symbol_id).
       await client.query(`ALTER TABLE ${this.t("branch_symbols")} ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
-      await client.query(`ALTER TABLE ${this.t("branch_symbols")} DROP CONSTRAINT IF EXISTS ${this.t("branch_symbols_pkey")}`);
-      await client.query(`ALTER TABLE ${this.t("branch_symbols")} ADD PRIMARY KEY (source_id, branch, symbol_id)`);
+      if (await pkNeedsMigration(this.t("branch_symbols"))) {
+        await client.query(`ALTER TABLE ${this.t("branch_symbols")} DROP CONSTRAINT IF EXISTS ${this.t("branch_symbols_pkey")}`);
+        await client.query(`ALTER TABLE ${this.t("branch_symbols")} ADD PRIMARY KEY (source_id, branch, symbol_id)`);
+      }
 
       // file_hashes: old PK was (file_path); new PK is (source_id, file_path).
       await client.query(`ALTER TABLE ${this.t("file_hashes")} ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
-      await client.query(`ALTER TABLE ${this.t("file_hashes")} DROP CONSTRAINT IF EXISTS ${this.t("file_hashes_pkey")}`);
-      await client.query(`ALTER TABLE ${this.t("file_hashes")} ADD PRIMARY KEY (source_id, file_path)`);
+      if (await pkNeedsMigration(this.t("file_hashes"))) {
+        await client.query(`ALTER TABLE ${this.t("file_hashes")} DROP CONSTRAINT IF EXISTS ${this.t("file_hashes_pkey")}`);
+        await client.query(`ALTER TABLE ${this.t("file_hashes")} ADD PRIMARY KEY (source_id, file_path)`);
+      }
     });
   }
 
