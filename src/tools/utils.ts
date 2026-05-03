@@ -58,19 +58,19 @@ export function formatIndexStats(stats: IndexStats, verbose: boolean = false): s
       lines.push("");
       lines.push(`Skipped files: ${stats.skippedFiles.length}`);
       if (tooLarge.length > 0) {
-        lines.push(`  Too large (${tooLarge.length}): ${tooLarge.slice(0, 5).map(f => f.path).join(", ")}${tooLarge.length > 5 ? "..." : ""}`);
+        lines.push(`  Too large (${tooLarge.length}):\n    ${tooLarge.slice(0, 5).map(f => f.path).join("\n    ")}${tooLarge.length > 5 ? "\n    ..." : ""}`);
       }
       if (excluded.length > 0) {
-        lines.push(`  Excluded (${excluded.length}): ${excluded.slice(0, 5).map(f => f.path).join(", ")}${excluded.length > 5 ? "..." : ""}`);
+        lines.push(`  Excluded (${excluded.length}):\n    ${excluded.slice(0, 5).map(f => f.path).join("\n    ")}${excluded.length > 5 ? "\n    ..." : ""}`);
       }
       if (gitignored.length > 0) {
-        lines.push(`  Gitignored (${gitignored.length}): ${gitignored.slice(0, 5).map(f => f.path).join(", ")}${gitignored.length > 5 ? "..." : ""}`);
+        lines.push(`  Gitignored (${gitignored.length}):\n    ${gitignored.slice(0, 5).map(f => f.path).join("\n    ")}${gitignored.length > 5 ? "\n    ..." : ""}`);
       }
     }
 
     if (stats.parseFailures.length > 0) {
       lines.push("");
-      lines.push(`Files with no extractable chunks (${stats.parseFailures.length}): ${stats.parseFailures.slice(0, 10).join(", ")}${stats.parseFailures.length > 10 ? "..." : ""}`);
+      lines.push(`Files with no extractable chunks (${stats.parseFailures.length}):\n  ${stats.parseFailures.slice(0, 10).join("\n  ")}${stats.parseFailures.length > 10 ? "\n  ..." : ""}`);
     }
   }
 
@@ -166,7 +166,7 @@ export function formatProgressTitle(progress: IndexProgress): string {
     case "scanning":
       return "Scanning files...";
     case "parsing":
-      return `Parsing: ${progress.filesProcessed}/${progress.totalFiles} files${progress.currentFiles?.length ? ` [${progress.currentFiles.join(", ")}]` : ""}`;
+      return `Parsing: ${progress.filesProcessed}/${progress.totalFiles} files${progress.currentFiles?.length ? `\n${progress.currentFiles.join("\n")}` : ""}`;
     case "embedding": {
       const etaStr = progress.estimatedSecondsRemaining != null
         ? ` (~${formatEta(progress.estimatedSecondsRemaining)} left)`
@@ -247,7 +247,7 @@ export function formatHealthCheck(result: HealthCheckResult): string {
   }
 
   if (result.filePaths.length > 0) {
-    lines.push(`Cleaned paths: ${result.filePaths.join(", ")}`);
+    lines.push(`Cleaned paths:\n  ${result.filePaths.join("\n  ")}`);
   }
 
   return lines.join("\n");
