@@ -13,6 +13,7 @@
  * validated tablePrefix config value (sanitized to [a-zA-Z0-9_] only).
  */
 
+import { createHash } from "crypto";
 import type {
   IDatabaseBackend,
   IVectorStoreBackend,
@@ -181,7 +182,8 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
           chunk_type TEXT NOT NULL,
           name       TEXT,
           language   TEXT NOT NULL,
-          hash       TEXT NOT NULL
+          hash       TEXT NOT NULL,
+          source_id  TEXT NOT NULL DEFAULT ''
         )
       `);
 
@@ -192,6 +194,16 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
           ON ${this.vectorsTable}
           USING hnsw (embedding vector_cosine_ops)
       `);
+
+      // Migration: add source_id for multi-source isolation (idempotent).
+      await client.query(`
+        ALTER TABLE ${this.vectorsTable}
+          ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS ${this.vectorsTable}_source_idx
+          ON ${this.vectorsTable} (source_id)
+      `);
     } finally {
       client.release();
     }
@@ -201,12 +213,12 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
   async load(): Promise<void> {}
   async save(): Promise<void> {}
 
-  async add(id: string, vector: number[], metadata: ChunkMetadata): Promise<void> {
+  async add(id: string, vector: number[], metadata: ChunkMetadata, sourceId?: string): Promise<void> {
     const pool = await this.getPool();
     await pool.query(
       `INSERT INTO ${this.vectorsTable}
-         (chunk_id, embedding, file_path, start_line, end_line, chunk_type, name, language, hash)
-       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9)
+         (chunk_id, embedding, file_path, start_line, end_line, chunk_type, name, language, hash, source_id)
+       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (chunk_id) DO UPDATE SET
          embedding  = EXCLUDED.embedding,
          file_path  = EXCLUDED.file_path,
@@ -215,7 +227,8 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
          chunk_type = EXCLUDED.chunk_type,
          name       = EXCLUDED.name,
          language   = EXCLUDED.language,
-         hash       = EXCLUDED.hash`,
+         hash       = EXCLUDED.hash,
+         source_id  = EXCLUDED.source_id`,
       [
         id,
         formatVector(vector),
@@ -226,23 +239,26 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
         metadata.name ?? null,
         metadata.language,
         metadata.hash,
+        sourceId ?? "",
       ]
     );
   }
 
   async addBatch(
-    items: Array<{ id: string; vector: number[]; metadata: ChunkMetadata }>
+    items: Array<{ id: string; vector: number[]; metadata: ChunkMetadata }>,
+    sourceId?: string
   ): Promise<void> {
     if (items.length === 0) return;
     const pool = await this.getPool();
     const client = await pool.connect();
+    const sid = sourceId ?? "";
     try {
       await client.query("BEGIN");
       for (const item of items) {
         await client.query(
           `INSERT INTO ${this.vectorsTable}
-             (chunk_id, embedding, file_path, start_line, end_line, chunk_type, name, language, hash)
-           VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9)
+             (chunk_id, embedding, file_path, start_line, end_line, chunk_type, name, language, hash, source_id)
+           VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)
            ON CONFLICT (chunk_id) DO UPDATE SET
              embedding  = EXCLUDED.embedding,
              file_path  = EXCLUDED.file_path,
@@ -251,7 +267,8 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
              chunk_type = EXCLUDED.chunk_type,
              name       = EXCLUDED.name,
              language   = EXCLUDED.language,
-             hash       = EXCLUDED.hash`,
+             hash       = EXCLUDED.hash,
+             source_id  = EXCLUDED.source_id`,
           [
             item.id,
             formatVector(item.vector),
@@ -262,6 +279,7 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
             item.metadata.name ?? null,
             item.metadata.language,
             item.metadata.hash,
+            sid,
           ]
         );
       }
@@ -274,17 +292,30 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
     }
   }
 
-  async search(queryVector: number[], limit: number): Promise<VectorSearchResult[]> {
+  async search(queryVector: number[], limit: number, sourceIds?: string[]): Promise<VectorSearchResult[]> {
     const pool = await this.getPool();
-    const { rows } = await pool.query<Record<string, unknown>>(
-      `SELECT chunk_id,
+    const vectorStr = formatVector(queryVector);
+    let queryText: string;
+    let params: unknown[];
+    if (sourceIds && sourceIds.length > 0) {
+      queryText = `SELECT chunk_id,
+              1 - (embedding <=> $1::vector) AS score,
+              file_path, start_line, end_line, chunk_type, name, language, hash
+       FROM ${this.vectorsTable}
+       WHERE source_id = ANY($3::text[])
+       ORDER BY embedding <=> $1::vector
+       LIMIT $2`;
+      params = [vectorStr, limit, sourceIds];
+    } else {
+      queryText = `SELECT chunk_id,
               1 - (embedding <=> $1::vector) AS score,
               file_path, start_line, end_line, chunk_type, name, language, hash
        FROM ${this.vectorsTable}
        ORDER BY embedding <=> $1::vector
-       LIMIT $2`,
-      [formatVector(queryVector), limit]
-    );
+       LIMIT $2`;
+      params = [vectorStr, limit];
+    }
+    const { rows } = await pool.query<Record<string, unknown>>(queryText, params);
 
     return rows.map((row) => ({
       id: row.chunk_id as string,
@@ -470,6 +501,16 @@ export class PgDatabaseBackend implements IDatabaseBackend {
       // Ensure pgvector extension is installed before any schema work.
       await client.query("CREATE EXTENSION IF NOT EXISTS vector");
 
+      // ── Sources registry ─────────────────────────────────────────
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS ${this.t("sources")} (
+          source_id   TEXT PRIMARY KEY,
+          root_path   TEXT NOT NULL UNIQUE,
+          created_at  BIGINT NOT NULL
+        )
+      `);
+
+      // ── Core tables ──────────────────────────────────────────────
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${this.t("metadata")} (
           key   TEXT PRIMARY KEY,
@@ -496,7 +537,8 @@ export class PgDatabaseBackend implements IDatabaseBackend {
           end_line     INTEGER NOT NULL,
           node_type    TEXT,
           name         TEXT,
-          language     TEXT NOT NULL
+          language     TEXT NOT NULL,
+          source_id    TEXT NOT NULL DEFAULT ''
         )
       `);
 
@@ -516,18 +558,23 @@ export class PgDatabaseBackend implements IDatabaseBackend {
         CREATE INDEX IF NOT EXISTS ${this.t("chunks_name_lower_idx")}
           ON ${this.t("chunks")} (lower(name))
       `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS ${this.t("chunks_source_idx")}
+          ON ${this.t("chunks")} (source_id)
+      `);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${this.t("branch_chunks")} (
-          branch   TEXT NOT NULL,
-          chunk_id TEXT NOT NULL,
-          PRIMARY KEY (branch, chunk_id)
+          source_id TEXT NOT NULL DEFAULT '',
+          branch    TEXT NOT NULL,
+          chunk_id  TEXT NOT NULL,
+          PRIMARY KEY (source_id, branch, chunk_id)
         )
       `);
 
       await client.query(`
         CREATE INDEX IF NOT EXISTS ${this.t("branch_chunks_branch_idx")}
-          ON ${this.t("branch_chunks")} (branch)
+          ON ${this.t("branch_chunks")} (source_id, branch)
       `);
 
       await client.query(`
@@ -540,7 +587,8 @@ export class PgDatabaseBackend implements IDatabaseBackend {
           start_col  INTEGER NOT NULL,
           end_line   INTEGER NOT NULL,
           end_col    INTEGER NOT NULL,
-          language   TEXT NOT NULL
+          language   TEXT NOT NULL,
+          source_id  TEXT NOT NULL DEFAULT ''
         )
       `);
 
@@ -552,6 +600,10 @@ export class PgDatabaseBackend implements IDatabaseBackend {
         CREATE INDEX IF NOT EXISTS ${this.t("symbols_name_idx")}
           ON ${this.t("symbols")} (name)
       `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS ${this.t("symbols_source_idx")}
+          ON ${this.t("symbols")} (source_id)
+      `);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${this.t("call_edges")} (
@@ -562,7 +614,8 @@ export class PgDatabaseBackend implements IDatabaseBackend {
           call_type      TEXT NOT NULL,
           line           INTEGER NOT NULL,
           col            INTEGER NOT NULL,
-          is_resolved    BOOLEAN NOT NULL DEFAULT FALSE
+          is_resolved    BOOLEAN NOT NULL DEFAULT FALSE,
+          source_id      TEXT NOT NULL DEFAULT ''
         )
       `);
 
@@ -578,24 +631,31 @@ export class PgDatabaseBackend implements IDatabaseBackend {
         CREATE INDEX IF NOT EXISTS ${this.t("call_edges_target_idx")}
           ON ${this.t("call_edges")} (target_name)
       `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS ${this.t("call_edges_source_idx")}
+          ON ${this.t("call_edges")} (source_id)
+      `);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${this.t("branch_symbols")} (
+          source_id TEXT NOT NULL DEFAULT '',
           branch    TEXT NOT NULL,
           symbol_id TEXT NOT NULL,
-          PRIMARY KEY (branch, symbol_id)
+          PRIMARY KEY (source_id, branch, symbol_id)
         )
       `);
 
       await client.query(`
         CREATE INDEX IF NOT EXISTS ${this.t("branch_symbols_branch_idx")}
-          ON ${this.t("branch_symbols")} (branch)
+          ON ${this.t("branch_symbols")} (source_id, branch)
       `);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${this.t("file_hashes")} (
-          file_path TEXT PRIMARY KEY,
-          hash      TEXT NOT NULL
+          source_id TEXT NOT NULL DEFAULT '',
+          file_path TEXT NOT NULL,
+          hash      TEXT NOT NULL,
+          PRIMARY KEY (source_id, file_path)
         )
       `);
 
@@ -621,12 +681,51 @@ export class PgDatabaseBackend implements IDatabaseBackend {
           doc_len  INTEGER NOT NULL
         )
       `);
+
+      // ── Migrations for existing databases ────────────────────────
+      // Add source_id columns to tables that may have been created before
+      // this schema version.  All are idempotent (IF NOT EXISTS / IF EXISTS).
+      await client.query(`ALTER TABLE ${this.t("chunks")}        ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
+      await client.query(`ALTER TABLE ${this.t("symbols")}       ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
+      await client.query(`ALTER TABLE ${this.t("call_edges")}    ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
+
+      // branch_chunks: old PK was (branch, chunk_id); new PK is (source_id, branch, chunk_id).
+      // Drop old PK, add source_id column, add new PK.
+      await client.query(`ALTER TABLE ${this.t("branch_chunks")} ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
+      await client.query(`ALTER TABLE ${this.t("branch_chunks")} DROP CONSTRAINT IF EXISTS ${this.t("branch_chunks_pkey")}`);
+      await client.query(`ALTER TABLE ${this.t("branch_chunks")} ADD PRIMARY KEY (source_id, branch, chunk_id)`);
+
+      // branch_symbols: old PK was (branch, symbol_id); new PK is (source_id, branch, symbol_id).
+      await client.query(`ALTER TABLE ${this.t("branch_symbols")} ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
+      await client.query(`ALTER TABLE ${this.t("branch_symbols")} DROP CONSTRAINT IF EXISTS ${this.t("branch_symbols_pkey")}`);
+      await client.query(`ALTER TABLE ${this.t("branch_symbols")} ADD PRIMARY KEY (source_id, branch, symbol_id)`);
+
+      // file_hashes: old PK was (file_path); new PK is (source_id, file_path).
+      await client.query(`ALTER TABLE ${this.t("file_hashes")} ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`);
+      await client.query(`ALTER TABLE ${this.t("file_hashes")} DROP CONSTRAINT IF EXISTS ${this.t("file_hashes_pkey")}`);
+      await client.query(`ALTER TABLE ${this.t("file_hashes")} ADD PRIMARY KEY (source_id, file_path)`);
     });
   }
 
   async close(): Promise<void> {
     await this.pool?.end();
     this.pool = null;
+  }
+
+  supportsSourceIsolation(): boolean {
+    return true;
+  }
+
+  async getOrCreateSource(rootPath: string): Promise<string> {
+    const sourceId = createHash("sha256").update(rootPath).digest("hex").slice(0, 32);
+    const pool = await this.getPool();
+    await pool.query(
+      `INSERT INTO ${this.t("sources")} (source_id, root_path, created_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (source_id) DO NOTHING`,
+      [sourceId, rootPath, Date.now()]
+    );
+    return sourceId;
   }
 
   // ── Embeddings ───────────────────────────────────────────────────
@@ -722,15 +821,16 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     );
   }
 
-  async upsertChunksBatch(chunks: ChunkData[]): Promise<void> {
+  async upsertChunksBatch(chunks: ChunkData[], sourceId?: string): Promise<void> {
     if (chunks.length === 0) return;
+    const sid = sourceId ?? "";
     await this.withClient(async (client) => {
       await client.query("BEGIN");
       for (const chunk of chunks) {
         await client.query(
           `INSERT INTO ${this.t("chunks")}
-             (chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             (chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language, source_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
            ON CONFLICT (chunk_id) DO UPDATE SET
              content_hash = EXCLUDED.content_hash,
              file_path    = EXCLUDED.file_path,
@@ -738,11 +838,13 @@ export class PgDatabaseBackend implements IDatabaseBackend {
              end_line     = EXCLUDED.end_line,
              node_type    = EXCLUDED.node_type,
              name         = EXCLUDED.name,
-             language     = EXCLUDED.language`,
+             language     = EXCLUDED.language,
+             source_id    = EXCLUDED.source_id`,
           [
             chunk.chunkId, chunk.contentHash, chunk.filePath,
             chunk.startLine, chunk.endLine,
             chunk.nodeType ?? null, chunk.name ?? null, chunk.language,
+            sid,
           ]
         );
       }
@@ -759,8 +861,15 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows[0] ? rowToChunkData(rows[0]) : null;
   }
 
-  async getChunksByFile(filePath: string): Promise<ChunkData[]> {
+  async getChunksByFile(filePath: string, sourceId?: string): Promise<ChunkData[]> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rows } = await pool.query<Record<string, unknown>>(
+        `SELECT * FROM ${this.t("chunks")} WHERE file_path = $1 AND source_id = $2 ORDER BY start_line`,
+        [filePath, sourceId]
+      );
+      return rows.map(rowToChunkData);
+    }
     const { rows } = await pool.query<Record<string, unknown>>(
       `SELECT * FROM ${this.t("chunks")} WHERE file_path = $1 ORDER BY start_line`,
       [filePath]
@@ -786,8 +895,15 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.map(rowToChunkData);
   }
 
-  async deleteChunksByFile(filePath: string): Promise<number> {
+  async deleteChunksByFile(filePath: string, sourceId?: string): Promise<number> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM ${this.t("chunks")} WHERE file_path = $1 AND source_id = $2`,
+        [filePath, sourceId]
+      );
+      return rowCount ?? 0;
+    }
     const { rowCount } = await pool.query(
       `DELETE FROM ${this.t("chunks")} WHERE file_path = $1`,
       [filePath]
@@ -795,8 +911,15 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rowCount ?? 0;
   }
 
-  async getChunkFilePaths(): Promise<string[]> {
+  async getChunkFilePaths(sourceId?: string): Promise<string[]> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rows } = await pool.query(
+        `SELECT DISTINCT file_path FROM ${this.t("chunks")} WHERE source_id = $1`,
+        [sourceId]
+      );
+      return rows.map((r: { file_path: string }) => r.file_path);
+    }
     const { rows } = await pool.query(
       `SELECT DISTINCT file_path FROM ${this.t("chunks")}`
     );
@@ -811,8 +934,8 @@ export class PgDatabaseBackend implements IDatabaseBackend {
       await client.query("BEGIN");
       for (const id of chunkIds) {
         await client.query(
-          `INSERT INTO ${this.t("branch_chunks")} (branch, chunk_id)
-           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          `INSERT INTO ${this.t("branch_chunks")} (source_id, branch, chunk_id)
+           VALUES ('', $1, $2) ON CONFLICT DO NOTHING`,
           [branch, id]
         );
       }
@@ -820,12 +943,31 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     });
   }
 
-  async addChunksToBranchBatch(branch: string, chunkIds: string[]): Promise<void> {
-    return this.addChunksToBranch(branch, chunkIds);
+  async addChunksToBranchBatch(branch: string, chunkIds: string[], sourceId?: string): Promise<void> {
+    if (chunkIds.length === 0) return;
+    const sid = sourceId ?? "";
+    await this.withClient(async (client) => {
+      await client.query("BEGIN");
+      for (const id of chunkIds) {
+        await client.query(
+          `INSERT INTO ${this.t("branch_chunks")} (source_id, branch, chunk_id)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [sid, branch, id]
+        );
+      }
+      await client.query("COMMIT");
+    });
   }
 
-  async clearBranch(branch: string): Promise<number> {
+  async clearBranch(branch: string, sourceId?: string): Promise<number> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM ${this.t("branch_chunks")} WHERE branch = $1 AND source_id = $2`,
+        [branch, sourceId]
+      );
+      return rowCount ?? 0;
+    }
     const { rowCount } = await pool.query(
       `DELETE FROM ${this.t("branch_chunks")} WHERE branch = $1`,
       [branch]
@@ -854,8 +996,15 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rowCount ?? 0;
   }
 
-  async getBranchChunkIds(branch: string): Promise<string[]> {
+  async getBranchChunkIds(branch: string, sourceIds?: string[]): Promise<string[]> {
     const pool = await this.getPool();
+    if (sourceIds && sourceIds.length > 0) {
+      const { rows } = await pool.query<{ chunk_id: string }>(
+        `SELECT chunk_id FROM ${this.t("branch_chunks")} WHERE branch = $1 AND source_id = ANY($2::text[])`,
+        [branch, sourceIds]
+      );
+      return rows.map((r) => r.chunk_id);
+    }
     const { rows } = await pool.query<{ chunk_id: string }>(
       `SELECT chunk_id FROM ${this.t("branch_chunks")} WHERE branch = $1`,
       [branch]
@@ -1034,15 +1183,16 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     );
   }
 
-  async upsertSymbolsBatch(symbols: SymbolData[]): Promise<void> {
+  async upsertSymbolsBatch(symbols: SymbolData[], sourceId?: string): Promise<void> {
+    const sid = sourceId ?? "";
     if (symbols.length === 0) return;
     await this.withClient(async (client) => {
       await client.query("BEGIN");
       for (const symbol of symbols) {
         await client.query(
           `INSERT INTO ${this.t("symbols")}
-             (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             (id, file_path, name, kind, start_line, start_col, end_line, end_col, language, source_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
            ON CONFLICT (id) DO UPDATE SET
              file_path  = EXCLUDED.file_path,
              name       = EXCLUDED.name,
@@ -1051,17 +1201,26 @@ export class PgDatabaseBackend implements IDatabaseBackend {
              start_col  = EXCLUDED.start_col,
              end_line   = EXCLUDED.end_line,
              end_col    = EXCLUDED.end_col,
-             language   = EXCLUDED.language`,
+             language   = EXCLUDED.language,
+             source_id  = EXCLUDED.source_id`,
           [symbol.id, symbol.filePath, symbol.name, symbol.kind,
-           symbol.startLine, symbol.startCol, symbol.endLine, symbol.endCol, symbol.language]
+           symbol.startLine, symbol.startCol, symbol.endLine, symbol.endCol, symbol.language,
+           sid]
         );
       }
       await client.query("COMMIT");
     });
   }
 
-  async getSymbolsByFile(filePath: string): Promise<SymbolData[]> {
+  async getSymbolsByFile(filePath: string, sourceId?: string): Promise<SymbolData[]> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rows } = await pool.query<Record<string, unknown>>(
+        `SELECT * FROM ${this.t("symbols")} WHERE file_path = $1 AND source_id = $2`,
+        [filePath, sourceId]
+      );
+      return rows.map(rowToSymbolData);
+    }
     const { rows } = await pool.query<Record<string, unknown>>(
       `SELECT * FROM ${this.t("symbols")} WHERE file_path = $1`,
       [filePath]
@@ -1096,8 +1255,15 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.map(rowToSymbolData);
   }
 
-  async deleteSymbolsByFile(filePath: string): Promise<number> {
+  async deleteSymbolsByFile(filePath: string, sourceId?: string): Promise<number> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM ${this.t("symbols")} WHERE file_path = $1 AND source_id = $2`,
+        [filePath, sourceId]
+      );
+      return rowCount ?? 0;
+    }
     const { rowCount } = await pool.query(
       `DELETE FROM ${this.t("symbols")} WHERE file_path = $1`,
       [filePath]
@@ -1126,15 +1292,16 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     );
   }
 
-  async upsertCallEdgesBatch(edges: CallEdgeData[]): Promise<void> {
+  async upsertCallEdgesBatch(edges: CallEdgeData[], sourceId?: string): Promise<void> {
+    const sid = sourceId ?? "";
     if (edges.length === 0) return;
     await this.withClient(async (client) => {
       await client.query("BEGIN");
       for (const edge of edges) {
         await client.query(
           `INSERT INTO ${this.t("call_edges")}
-             (id, from_symbol_id, target_name, to_symbol_id, call_type, line, col, is_resolved)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             (id, from_symbol_id, target_name, to_symbol_id, call_type, line, col, is_resolved, source_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
            ON CONFLICT (id) DO UPDATE SET
              from_symbol_id = EXCLUDED.from_symbol_id,
              target_name    = EXCLUDED.target_name,
@@ -1142,17 +1309,28 @@ export class PgDatabaseBackend implements IDatabaseBackend {
              call_type      = EXCLUDED.call_type,
              line           = EXCLUDED.line,
              col            = EXCLUDED.col,
-             is_resolved    = EXCLUDED.is_resolved`,
+             is_resolved    = EXCLUDED.is_resolved,
+             source_id      = EXCLUDED.source_id`,
           [edge.id, edge.fromSymbolId, edge.targetName, edge.toSymbolId ?? null,
-           edge.callType, edge.line, edge.col, edge.isResolved]
+           edge.callType, edge.line, edge.col, edge.isResolved, sid]
         );
       }
       await client.query("COMMIT");
     });
   }
 
-  async getCallers(targetName: string, branch: string): Promise<CallEdgeData[]> {
+  async getCallers(targetName: string, branch: string, sourceIds?: string[]): Promise<CallEdgeData[]> {
     const pool = await this.getPool();
+    if (sourceIds && sourceIds.length > 0) {
+      const { rows } = await pool.query<Record<string, unknown>>(
+        `SELECT ce.*
+         FROM ${this.t("call_edges")} ce
+         JOIN ${this.t("branch_symbols")} bs ON bs.symbol_id = ce.from_symbol_id
+         WHERE ce.target_name = $1 AND bs.branch = $2 AND bs.source_id = ANY($3::text[])`,
+        [targetName, branch, sourceIds]
+      );
+      return rows.map((r) => rowToCallEdgeData(r));
+    }
     const { rows } = await pool.query<Record<string, unknown>>(
       `SELECT ce.*
        FROM ${this.t("call_edges")} ce
@@ -1163,8 +1341,21 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.map((r) => rowToCallEdgeData(r));
   }
 
-  async getCallersWithContext(targetName: string, branch: string): Promise<CallEdgeData[]> {
+  async getCallersWithContext(targetName: string, branch: string, sourceIds?: string[]): Promise<CallEdgeData[]> {
     const pool = await this.getPool();
+    if (sourceIds && sourceIds.length > 0) {
+      const { rows } = await pool.query<Record<string, unknown>>(
+        `SELECT ce.*,
+                s.name      AS from_symbol_name,
+                s.file_path AS from_symbol_file_path
+         FROM ${this.t("call_edges")} ce
+         JOIN ${this.t("symbols")} s           ON s.id = ce.from_symbol_id
+         JOIN ${this.t("branch_symbols")} bs   ON bs.symbol_id = ce.from_symbol_id
+         WHERE ce.target_name = $1 AND bs.branch = $2 AND bs.source_id = ANY($3::text[])`,
+        [targetName, branch, sourceIds]
+      );
+      return rows.map((r) => rowToCallEdgeData(r, true));
+    }
     const { rows } = await pool.query<Record<string, unknown>>(
       `SELECT ce.*,
               s.name      AS from_symbol_name,
@@ -1178,8 +1369,18 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.map((r) => rowToCallEdgeData(r, true));
   }
 
-  async getCallees(symbolId: string, branch: string): Promise<CallEdgeData[]> {
+  async getCallees(symbolId: string, branch: string, sourceIds?: string[]): Promise<CallEdgeData[]> {
     const pool = await this.getPool();
+    if (sourceIds && sourceIds.length > 0) {
+      const { rows } = await pool.query<Record<string, unknown>>(
+        `SELECT ce.*
+         FROM ${this.t("call_edges")} ce
+         JOIN ${this.t("branch_symbols")} bs ON bs.symbol_id = ce.from_symbol_id
+         WHERE ce.from_symbol_id = $1 AND bs.branch = $2 AND bs.source_id = ANY($3::text[])`,
+        [symbolId, branch, sourceIds]
+      );
+      return rows.map((r) => rowToCallEdgeData(r));
+    }
     const { rows } = await pool.query<Record<string, unknown>>(
       `SELECT ce.*
        FROM ${this.t("call_edges")} ce
@@ -1190,8 +1391,18 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.map((r) => rowToCallEdgeData(r));
   }
 
-  async deleteCallEdgesByFile(filePath: string): Promise<number> {
+  async deleteCallEdgesByFile(filePath: string, sourceId?: string): Promise<number> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM ${this.t("call_edges")}
+         WHERE from_symbol_id IN (
+           SELECT id FROM ${this.t("symbols")} WHERE file_path = $1 AND source_id = $2
+         )`,
+        [filePath, sourceId]
+      );
+      return rowCount ?? 0;
+    }
     const { rowCount } = await pool.query(
       `DELETE FROM ${this.t("call_edges")}
        WHERE from_symbol_id IN (
@@ -1220,8 +1431,8 @@ export class PgDatabaseBackend implements IDatabaseBackend {
       await client.query("BEGIN");
       for (const id of symbolIds) {
         await client.query(
-          `INSERT INTO ${this.t("branch_symbols")} (branch, symbol_id)
-           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          `INSERT INTO ${this.t("branch_symbols")} (source_id, branch, symbol_id)
+           VALUES ('', $1, $2) ON CONFLICT DO NOTHING`,
           [branch, id]
         );
       }
@@ -1229,12 +1440,31 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     });
   }
 
-  async addSymbolsToBranchBatch(branch: string, symbolIds: string[]): Promise<void> {
-    return this.addSymbolsToBranch(branch, symbolIds);
+  async addSymbolsToBranchBatch(branch: string, symbolIds: string[], sourceId?: string): Promise<void> {
+    if (symbolIds.length === 0) return;
+    const sid = sourceId ?? "";
+    await this.withClient(async (client) => {
+      await client.query("BEGIN");
+      for (const id of symbolIds) {
+        await client.query(
+          `INSERT INTO ${this.t("branch_symbols")} (source_id, branch, symbol_id)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [sid, branch, id]
+        );
+      }
+      await client.query("COMMIT");
+    });
   }
 
-  async getBranchSymbolIds(branch: string): Promise<string[]> {
+  async getBranchSymbolIds(branch: string, sourceIds?: string[]): Promise<string[]> {
     const pool = await this.getPool();
+    if (sourceIds && sourceIds.length > 0) {
+      const { rows } = await pool.query<{ symbol_id: string }>(
+        `SELECT symbol_id FROM ${this.t("branch_symbols")} WHERE branch = $1 AND source_id = ANY($2::text[])`,
+        [branch, sourceIds]
+      );
+      return rows.map((r) => r.symbol_id);
+    }
     const { rows } = await pool.query<{ symbol_id: string }>(
       `SELECT symbol_id FROM ${this.t("branch_symbols")} WHERE branch = $1`,
       [branch]
@@ -1242,8 +1472,15 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.map((r) => r.symbol_id);
   }
 
-  async clearBranchSymbols(branch: string): Promise<number> {
+  async clearBranchSymbols(branch: string, sourceId?: string): Promise<number> {
     const pool = await this.getPool();
+    if (sourceId !== undefined) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM ${this.t("branch_symbols")} WHERE branch = $1 AND source_id = $2`,
+        [branch, sourceId]
+      );
+      return rowCount ?? 0;
+    }
     const { rowCount } = await pool.query(
       `DELETE FROM ${this.t("branch_symbols")} WHERE branch = $1`,
       [branch]
@@ -1321,8 +1558,8 @@ export class PgDatabaseBackend implements IDatabaseBackend {
   async setFileHash(filePath: string, hash: string): Promise<void> {
     const pool = await this.getPool();
     await pool.query(
-      `INSERT INTO ${this.t("file_hashes")} (file_path, hash) VALUES ($1, $2)
-       ON CONFLICT (file_path) DO UPDATE SET hash = EXCLUDED.hash`,
+      `INSERT INTO ${this.t("file_hashes")} (source_id, file_path, hash) VALUES ('', $1, $2)
+       ON CONFLICT (source_id, file_path) DO UPDATE SET hash = EXCLUDED.hash`,
       [filePath, hash]
     );
   }
@@ -1330,7 +1567,7 @@ export class PgDatabaseBackend implements IDatabaseBackend {
   async deleteFileHash(filePath: string): Promise<void> {
     const pool = await this.getPool();
     await pool.query(
-      `DELETE FROM ${this.t("file_hashes")} WHERE file_path = $1`,
+      `DELETE FROM ${this.t("file_hashes")} WHERE source_id = '' AND file_path = $1`,
       [filePath]
     );
   }
@@ -1343,15 +1580,16 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return new Map(rows.map((r) => [r.file_path, r.hash]));
   }
 
-  async setFileHashesBatch(hashes: Map<string, string>): Promise<void> {
+  async setFileHashesBatch(hashes: Map<string, string>, sourceId?: string): Promise<void> {
     if (hashes.size === 0) return;
+    const sid = sourceId ?? "";
     await this.withClient(async (client) => {
       await client.query("BEGIN");
       for (const [filePath, hash] of hashes) {
         await client.query(
-          `INSERT INTO ${this.t("file_hashes")} (file_path, hash) VALUES ($1, $2)
-           ON CONFLICT (file_path) DO UPDATE SET hash = EXCLUDED.hash`,
-          [filePath, hash]
+          `INSERT INTO ${this.t("file_hashes")} (source_id, file_path, hash) VALUES ($1, $2, $3)
+           ON CONFLICT (source_id, file_path) DO UPDATE SET hash = EXCLUDED.hash`,
+          [sid, filePath, hash]
         );
       }
       await client.query("COMMIT");
@@ -1502,13 +1740,55 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     }
   }
 
-  async searchBm25(query: string, limit: number): Promise<Map<string, number> | null> {
+  async searchBm25(query: string, limit: number, sourceIds?: string[]): Promise<Map<string, number> | null> {
     const terms = tokenizeText(query);
     if (terms.length === 0) return new Map();
 
     const pool = await this.getPool();
-    const { rows } = await pool.query<{ chunk_id: string; score: number }>(
-      `WITH
+    let queryText: string;
+    let params: unknown[];
+
+    if (sourceIds && sourceIds.length > 0) {
+      // Scope BM25 corpus stats and results to the given sources by joining chunks.
+      queryText = `WITH
+        qt AS (SELECT UNNEST($1::text[]) AS term),
+        src_chunks AS (
+          SELECT chunk_id FROM ${this.t("chunks")} WHERE source_id = ANY($3::text[])
+        ),
+        tdf AS (
+          SELECT p.term, COUNT(DISTINCT p.chunk_id)::FLOAT AS df
+          FROM ${this.t("inverted_index_postings")} p
+          JOIN src_chunks sc ON p.chunk_id = sc.chunk_id
+          JOIN qt ON p.term = qt.term
+          GROUP BY p.term
+        ),
+        stats AS (
+          SELECT
+            COUNT(*)::FLOAT                      AS total_docs,
+            COALESCE(AVG(dl.doc_len)::FLOAT, 1.0) AS avg_dl
+          FROM ${this.t("inverted_index_doc_lengths")} dl
+          JOIN src_chunks sc ON dl.chunk_id = sc.chunk_id
+        ),
+        scored AS (
+          SELECT
+            p.chunk_id,
+            SUM(
+              LN((s.total_docs - t.df + 0.5) / (t.df + 0.5) + 1.0)
+              * (p.token_count::FLOAT * 2.2)
+              / (p.token_count::FLOAT + 1.2 * (0.25 + 0.75 * dl.doc_len::FLOAT / s.avg_dl))
+            ) AS score
+          FROM ${this.t("inverted_index_postings")} p
+          JOIN src_chunks sc                              ON p.chunk_id = sc.chunk_id
+          JOIN qt                                         ON p.term     = qt.term
+          JOIN tdf t                                      ON p.term     = t.term
+          JOIN ${this.t("inverted_index_doc_lengths")} dl ON p.chunk_id = dl.chunk_id
+          CROSS JOIN stats s
+          GROUP BY p.chunk_id
+        )
+      SELECT chunk_id, score FROM scored ORDER BY score DESC LIMIT $2`;
+      params = [terms, limit, sourceIds];
+    } else {
+      queryText = `WITH
         qt AS (SELECT UNNEST($1::text[]) AS term),
         tdf AS (
           SELECT p.term, COUNT(DISTINCT p.chunk_id)::FLOAT AS df
@@ -1537,10 +1817,11 @@ export class PgDatabaseBackend implements IDatabaseBackend {
           CROSS JOIN stats s
           GROUP BY p.chunk_id
         )
-      SELECT chunk_id, score FROM scored ORDER BY score DESC LIMIT $2`,
-      [terms, limit]
-    );
+      SELECT chunk_id, score FROM scored ORDER BY score DESC LIMIT $2`;
+      params = [terms, limit];
+    }
 
+    const { rows } = await pool.query<{ chunk_id: string; score: number }>(queryText, params);
     const result = new Map<string, number>();
     for (const row of rows) result.set(row.chunk_id, Number(row.score));
     return result;
@@ -1548,70 +1829,69 @@ export class PgDatabaseBackend implements IDatabaseBackend {
 
   // ── Bulk file-hash replacement ────────────────────────────────────
 
-  async replaceAllFileHashes(hashes: Map<string, string>): Promise<void> {
+  async replaceAllFileHashes(hashes: Map<string, string>, sourceId?: string): Promise<void> {
+    const sid = sourceId ?? "";
     await this.withClient(async (client) => {
       await client.query("BEGIN");
-      await client.query(`TRUNCATE TABLE ${this.t("file_hashes")}`);
+      await client.query(
+        `DELETE FROM ${this.t("file_hashes")} WHERE source_id = $1`,
+        [sid]
+      );
       for (const [filePath, hash] of hashes) {
         await client.query(
-          `INSERT INTO ${this.t("file_hashes")} (file_path, hash) VALUES ($1, $2)`,
-          [filePath, hash]
+          `INSERT INTO ${this.t("file_hashes")} (source_id, file_path, hash) VALUES ($1, $2, $3)`,
+          [sid, filePath, hash]
         );
       }
       await client.query("COMMIT");
     });
   }
 
-  async getFileHashBatch(filePaths: string[]): Promise<Map<string, string>> {
+  async getFileHashBatch(filePaths: string[], sourceId?: string): Promise<Map<string, string>> {
     if (filePaths.length === 0) return new Map();
     const pool = await this.getPool();
+    const sid = sourceId ?? "";
     const { rows } = await pool.query<{ file_path: string; hash: string }>(
-      `SELECT file_path, hash FROM ${this.t("file_hashes")} WHERE file_path = ANY($1::text[])`,
-      [filePaths]
+      `SELECT file_path, hash FROM ${this.t("file_hashes")}
+       WHERE source_id = $1 AND file_path = ANY($2::text[])`,
+      [sid, filePaths]
     );
     return new Map(rows.map((r) => [r.file_path, r.hash]));
   }
 
-  async hasFileHashesOutsideRoots(roots: string[]): Promise<boolean> {
-    if (roots.length === 0) return false;
+  async hasSourcesOtherThan(sourceIds: string[]): Promise<boolean> {
+    if (sourceIds.length === 0) {
+      const pool = await this.getPool();
+      const { rows } = await pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM ${this.t("file_hashes")}`
+      );
+      return parseInt(rows[0]?.cnt ?? "0", 10) > 0;
+    }
     const pool = await this.getPool();
     const { rows } = await pool.query<{ exists: boolean }>(
       `SELECT EXISTS(
          SELECT 1 FROM ${this.t("file_hashes")}
-         WHERE NOT EXISTS (
-           SELECT 1 FROM UNNEST($1::text[]) AS r(root)
-           WHERE file_path = r.root OR file_path LIKE r.root || '/%'
-         )
+         WHERE source_id != ALL($1::text[])
        ) AS exists`,
-      [roots]
+      [sourceIds]
     );
     return rows[0]?.exists ?? false;
   }
 
-  async getFilePathsInRoots(roots: string[]): Promise<string[]> {
-    if (roots.length === 0) return [];
+  async getFilePathsBySource(sourceId: string): Promise<string[]> {
     const pool = await this.getPool();
     const { rows } = await pool.query<{ file_path: string }>(
-      `SELECT file_path FROM ${this.t("file_hashes")}
-       WHERE EXISTS (
-         SELECT 1 FROM UNNEST($1::text[]) AS r(root)
-         WHERE file_path = r.root OR file_path LIKE r.root || '/%'
-       )`,
-      [roots]
+      `SELECT file_path FROM ${this.t("file_hashes")} WHERE source_id = $1`,
+      [sourceId]
     );
     return rows.map((r) => r.file_path);
   }
 
-  async deleteFileHashesInRoots(roots: string[]): Promise<void> {
-    if (roots.length === 0) return;
+  async deleteFileHashesBySource(sourceId: string): Promise<void> {
     const pool = await this.getPool();
     await pool.query(
-      `DELETE FROM ${this.t("file_hashes")}
-       WHERE EXISTS (
-         SELECT 1 FROM UNNEST($1::text[]) AS r(root)
-         WHERE file_path = r.root OR file_path LIKE r.root || '/%'
-       )`,
-      [roots]
+      `DELETE FROM ${this.t("file_hashes")} WHERE source_id = $1`,
+      [sourceId]
     );
   }
 }

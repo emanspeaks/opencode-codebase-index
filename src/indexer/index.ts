@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, promises as fsPromises } from "fs";
+import { createHash } from "crypto";
 import * as path from "path";
 import { performance } from "perf_hooks";
 import PQueue from "p-queue";
@@ -2165,13 +2166,21 @@ export class Indexer {
     return roots.some((root) => isPathWithinRoot(filePath, root));
   }
 
+  private computeSourceId(rootPath: string): string {
+    return createHash("sha256").update(rootPath).digest("hex").slice(0, 32);
+  }
+
   private async clearScopedFileHashCache(roots: string[]): Promise<void> {
-    await this.database!.deleteFileHashesInRoots(roots);
+    for (const root of roots) {
+      await this.database!.deleteFileHashesBySource(this.computeSourceId(root));
+    }
   }
 
   private async replaceScopedFileHashCache(currentFileHashes: Map<string, string>, roots: string[]): Promise<void> {
-    await this.database!.deleteFileHashesInRoots(roots);
-    await this.database!.setFileHashesBatch(currentFileHashes);
+    for (const root of roots) {
+      await this.database!.deleteFileHashesBySource(this.computeSourceId(root));
+    }
+    await this.database!.setFileHashesBatch(currentFileHashes, this.computeSourceId(this.projectRoot));
   }
 
   private partitionFailedBatches(roots: string[], maxChunkTokens?: number): { scoped: FailedBatch[]; retained: SerializedFailedBatch[] } {
@@ -2209,7 +2218,7 @@ export class Indexer {
   }
 
   private async hasForeignScopedFileHashData(roots: string[]): Promise<boolean> {
-    return this.database!.hasFileHashesOutsideRoots(roots);
+    return this.database!.hasSourcesOtherThan(roots.map(r => this.computeSourceId(r)));
   }
 
   private hasForeignScopedFailedBatches(roots: string[]): boolean {
@@ -2263,10 +2272,14 @@ export class Indexer {
   ): Promise<{ removedChunkIds: string[]; hasForeignData: boolean }> {
     const allMetadata = await store.getAllMetadata();
     const scopedEntries = allMetadata.filter(({ metadata }) => this.isFileInCurrentScope(metadata.filePath, roots));
-    const filePaths = new Set<string>([
-      ...await this.database!.getFilePathsInRoots(roots),
-      ...scopedEntries.map(({ metadata }) => metadata.filePath),
-    ]);
+
+    // Collect file paths from all scoped sources + vector store metadata
+    const filePaths = new Set<string>(scopedEntries.map(({ metadata }) => metadata.filePath));
+    for (const root of roots) {
+      for (const fp of await this.database!.getFilePathsBySource(this.computeSourceId(root))) {
+        filePaths.add(fp);
+      }
+    }
 
     const projectRootPath = path.resolve(this.projectRoot);
     const projectLocalFilePaths = new Set<string>(
@@ -2994,7 +3007,7 @@ export class Indexer {
     if (chunkDataBatch.length > 0) {
       await this.database.upsertChunksBatch(chunkDataBatch);
     }
-    await this.database.addChunksToBranchBatch(this.getBranchCatalogKey(), chunkIds);
+    await this.database.addChunksToBranchBatch(this.getBranchCatalogKey(), chunkIds, this.computeSourceId(this.projectRoot));
   }
 
   private async loadIndexMetadata(): Promise<IndexMetadata | null> {
@@ -3152,6 +3165,7 @@ export class Indexer {
     }
 
     await this.acquireIndexingLock();
+    const sourceId = this.computeSourceId(this.projectRoot);
     // Clear any stale progress snapshot from a previous run
     void database.deleteMetadata(PROGRESS_SNAPSHOT_KEY).catch(() => { /* best-effort */ });
     this.embeddingPhaseStartTime = 0;
@@ -3205,7 +3219,7 @@ export class Indexer {
 
     // Fetch only the hashes for files we are about to scan — avoids a full
     // table load and skips stale records for deleted or out-of-scope files.
-    const storedHashes = await this.database!.getFileHashBatch(files.map((f) => f.path));
+    const storedHashes = await this.database!.getFileHashBatch(files.map((f) => f.path), sourceId);
 
     // Phase 1: Hash scan — classify files without reading content
     const changedFileMeta: Array<{ path: string; hash: string }> = [];
@@ -3234,11 +3248,11 @@ export class Indexer {
 
     // Phase 2: Deleted file cleanup — remove chunks for files no longer on disk
     let removedCount = 0;
-    const allChunkFilePaths = await this.database!.getChunkFilePaths();
+    const allChunkFilePaths = await this.database!.getChunkFilePaths(sourceId);
     for (const fp of allChunkFilePaths) {
       if (!currentFilePathSet.has(fp)) {
         if (scopedRoots && !this.isFileInCurrentScope(fp, scopedRoots)) continue;
-        const oldChunks = await this.database!.getChunksByFile(fp);
+        const oldChunks = await this.database!.getChunksByFile(fp, sourceId);
         const oldChunkIds = oldChunks.map(c => c.chunkId);
         for (const chunkId of oldChunkIds) {
           await store.remove(chunkId);
@@ -3250,22 +3264,22 @@ export class Indexer {
     }
 
     // Phase 3: Branch catalog init — clear upfront, rebuild incrementally below
-    await database.clearBranch(branchCatalogKey);
-    await database.clearBranchSymbols(branchCatalogKey);
+    await database.clearBranch(branchCatalogKey, sourceId);
+    await database.clearBranchSymbols(branchCatalogKey, sourceId);
 
     // Phase 4: Unchanged files → branch catalog (batched, parallel DB reads)
     const FILE_BATCH_SIZE = this.config.indexing.fileBatchSize;
     for (let i = 0; i < unchangedFilePaths.length; i += FILE_BATCH_SIZE) {
       const batch = unchangedFilePaths.slice(i, i + FILE_BATCH_SIZE);
       const [chunkResults, symbolResults] = await Promise.all([
-        Promise.all(batch.map(fp => this.database!.getChunksByFile(fp))),
-        Promise.all(batch.map(fp => this.database!.getSymbolsByFile(fp))),
+        Promise.all(batch.map(fp => this.database!.getChunksByFile(fp, sourceId))),
+        Promise.all(batch.map(fp => this.database!.getSymbolsByFile(fp, sourceId))),
       ]);
       const batchChunkIds = chunkResults.flat().map(c => c.chunkId);
       const batchSymbolIds = symbolResults.flat().map(s => s.id);
       stats.existingChunks += batchChunkIds.length;
-      if (batchChunkIds.length > 0) await database.addChunksToBranchBatch(branchCatalogKey, batchChunkIds);
-      if (batchSymbolIds.length > 0) await database.addSymbolsToBranchBatch(branchCatalogKey, batchSymbolIds);
+      if (batchChunkIds.length > 0) await database.addChunksToBranchBatch(branchCatalogKey, batchChunkIds, sourceId);
+      if (batchSymbolIds.length > 0) await database.addSymbolsToBranchBatch(branchCatalogKey, batchSymbolIds, sourceId);
     }
 
     // Phase 5: Changed files — main batch loop
@@ -3495,7 +3509,7 @@ export class Indexer {
         }
 
         // Per-file existing chunk lookup replaces the global existingChunks Map
-        const existingFileChunks = await this.database!.getChunksByFile(parsed.path);
+        const existingFileChunks = await this.database!.getChunksByFile(parsed.path, sourceId);
         const existingChunkHashes = new Map(existingFileChunks.map(c => [c.chunkId, c.contentHash]));
         const newChunkIdsForFile = new Set<string>();
         const chunkDataForFile: ChunkData[] = [];
@@ -3542,7 +3556,7 @@ export class Indexer {
         }
 
         if (chunkDataForFile.length > 0) {
-          await this.database!.upsertChunksBatch(chunkDataForFile);
+          await this.database!.upsertChunksBatch(chunkDataForFile, sourceId);
         }
 
         // Per-file orphan removal (chunks no longer produced by re-parsing)
@@ -3560,8 +3574,8 @@ export class Indexer {
         }
 
         // Call graph extraction for this file
-        await database.deleteCallEdgesByFile(parsed.path);
-        await database.deleteSymbolsByFile(parsed.path);
+        await database.deleteCallEdgesByFile(parsed.path, sourceId);
+        await database.deleteSymbolsByFile(parsed.path, sourceId);
         const fileSymbols: SymbolData[] = [];
         for (const chunk of parsed.chunks) {
           if (!chunk.name || !CALL_GRAPH_SYMBOL_CHUNK_TYPES.has(chunk.chunkType)) continue;
@@ -3588,7 +3602,7 @@ export class Indexer {
         }
 
         if (fileSymbols.length > 0) {
-          await database.upsertSymbolsBatch(fileSymbols);
+          await database.upsertSymbolsBatch(fileSymbols, sourceId);
         }
 
         const fileLanguage = parsed.chunks[0]?.language;
@@ -3629,7 +3643,7 @@ export class Indexer {
                 });
               }
               if (edges.length > 0) {
-                await database.upsertCallEdgesBatch(edges);
+                await database.upsertCallEdgesBatch(edges, sourceId);
                 for (const edge of edges) {
                   const lookupKey = isCaseInsensitiveLanguage ? edge.targetName.toLowerCase() : edge.targetName;
                   const candidates = symbolsByName.get(lookupKey);
@@ -3644,15 +3658,15 @@ export class Indexer {
       }
 
       // Incremental branch catalog update for this file batch
-      if (batchChunkIds.length > 0) await database.addChunksToBranchBatch(branchCatalogKey, batchChunkIds);
-      if (batchSymbolIds.length > 0) await database.addSymbolsToBranchBatch(branchCatalogKey, batchSymbolIds);
+      if (batchChunkIds.length > 0) await database.addChunksToBranchBatch(branchCatalogKey, batchChunkIds, sourceId);
+      if (batchSymbolIds.length > 0) await database.addSymbolsToBranchBatch(branchCatalogKey, batchSymbolIds, sourceId);
       stats.totalChunks += batchPendingChunks.length;
 
       // Embed this batch; queue.onIdle() ensures we don't accumulate unbounded pending chunks
       await embedPendingChunks(batchPendingChunks);
 
       // Write hashes for this batch immediately so crash recovery can skip already-processed files
-      await this.database!.setFileHashesBatch(new Map(fileBatch.map(f => [f.path, f.hash])));
+      await this.database!.setFileHashesBatch(new Map(fileBatch.map(f => [f.path, f.hash])), sourceId);
 
       // Periodically flush the vector store so crash recovery can skip already-processed files
       // without re-adding their vectors. store.save() is a no-op for pgvector (already durable).
@@ -3715,7 +3729,7 @@ export class Indexer {
     if (scopedRoots) {
       await this.replaceScopedFileHashCache(currentFileHashes, scopedRoots);
     } else {
-      await this.database!.replaceAllFileHashes(currentFileHashes);
+      await this.database!.replaceAllFileHashes(currentFileHashes, sourceId);
     }
 
     // Auto-GC after indexing: check if orphan count exceeds threshold
@@ -4244,7 +4258,7 @@ export class Indexer {
         invertedIndex.clear();
         await this.database!.saveInvertedIndex(invertedIndex.serialize());
 
-        await this.database!.replaceAllFileHashes(new Map());
+        await this.database!.replaceAllFileHashes(new Map(), this.computeSourceId(this.projectRoot));
 
         await database.clearAllIndexedData();
         this.saveFailedBatches([]);
@@ -4285,7 +4299,7 @@ export class Indexer {
     await this.database!.saveInvertedIndex(invertedIndex.serialize());
 
     // Clear file hash cache so all files are re-parsed
-    await this.database!.replaceAllFileHashes(new Map());
+    await this.database!.replaceAllFileHashes(new Map(), this.computeSourceId(this.projectRoot));
 
     // Clear persisted index data across all branches so force rebuilds
     // cannot reuse stale chunks, symbols, or embeddings from a prior provider.

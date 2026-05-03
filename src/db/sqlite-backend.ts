@@ -8,13 +8,8 @@
 
 import * as path from "path";
 import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "fs";
-
-function isPathUnderRoot(filePath: string, root: string): boolean {
-  const r = path.resolve(root);
-  const f = path.resolve(filePath);
-  return f === r || f.startsWith(r + path.sep);
-}
 import { promises as fsPromises } from "fs";
+import { createHash } from "crypto";
 import type {
   IDatabaseBackend,
   IVectorStoreBackend,
@@ -50,17 +45,18 @@ export class SqliteVectorStoreBackend implements IVectorStoreBackend {
     this.inner!.save();
   }
 
-  async add(id: string, vector: number[], metadata: ChunkMetadata): Promise<void> {
+  async add(id: string, vector: number[], metadata: ChunkMetadata, _sourceId?: string): Promise<void> {
     this.inner!.add(id, vector, metadata);
   }
 
   async addBatch(
-    items: Array<{ id: string; vector: number[]; metadata: ChunkMetadata }>
+    items: Array<{ id: string; vector: number[]; metadata: ChunkMetadata }>,
+    _sourceId?: string
   ): Promise<void> {
     this.inner!.addBatch(items);
   }
 
-  async search(queryVector: number[], limit: number): Promise<VectorSearchResult[]> {
+  async search(queryVector: number[], limit: number, _sourceIds?: string[]): Promise<VectorSearchResult[]> {
     return this.inner!.search(queryVector, limit);
   }
 
@@ -122,6 +118,14 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     this.inner = null;
   }
 
+  supportsSourceIsolation(): boolean {
+    return false;
+  }
+
+  async getOrCreateSource(rootPath: string): Promise<string> {
+    return createHash("sha256").update(rootPath).digest("hex").slice(0, 32);
+  }
+
   /** Expose path so the Indexer can check for file existence and corruption. */
   getDbPath(): string {
     return this.dbPath;
@@ -178,7 +182,7 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     this.inner!.upsertChunk(chunk);
   }
 
-  async upsertChunksBatch(chunks: ChunkData[]): Promise<void> {
+  async upsertChunksBatch(chunks: ChunkData[], _sourceId?: string): Promise<void> {
     this.inner!.upsertChunksBatch(chunks);
   }
 
@@ -186,7 +190,7 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     return this.inner!.getChunk(chunkId);
   }
 
-  async getChunksByFile(filePath: string): Promise<ChunkData[]> {
+  async getChunksByFile(filePath: string, _sourceId?: string): Promise<ChunkData[]> {
     return this.inner!.getChunksByFile(filePath);
   }
 
@@ -198,11 +202,11 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     return this.inner!.getChunksByNameCi(name);
   }
 
-  async deleteChunksByFile(filePath: string): Promise<number> {
+  async deleteChunksByFile(filePath: string, _sourceId?: string): Promise<number> {
     return this.inner!.deleteChunksByFile(filePath);
   }
 
-  async getChunkFilePaths(): Promise<string[]> {
+  async getChunkFilePaths(_sourceId?: string): Promise<string[]> {
     return Array.from(this.readFileHashesFromDisk().keys());
   }
 
@@ -212,11 +216,11 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     this.inner!.addChunksToBranch(branch, chunkIds);
   }
 
-  async addChunksToBranchBatch(branch: string, chunkIds: string[]): Promise<void> {
+  async addChunksToBranchBatch(branch: string, chunkIds: string[], _sourceId?: string): Promise<void> {
     this.inner!.addChunksToBranchBatch(branch, chunkIds);
   }
 
-  async clearBranch(branch: string): Promise<number> {
+  async clearBranch(branch: string, _sourceId?: string): Promise<number> {
     return this.inner!.clearBranch(branch);
   }
 
@@ -228,7 +232,7 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     return this.inner!.deleteBranchChunksForBranch(branch, chunkIds);
   }
 
-  async getBranchChunkIds(branch: string): Promise<string[]> {
+  async getBranchChunkIds(branch: string, _sourceIds?: string[]): Promise<string[]> {
     return this.inner!.getBranchChunkIds(branch);
   }
 
@@ -290,11 +294,11 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     this.inner!.upsertSymbol(symbol);
   }
 
-  async upsertSymbolsBatch(symbols: SymbolData[]): Promise<void> {
+  async upsertSymbolsBatch(symbols: SymbolData[], _sourceId?: string): Promise<void> {
     this.inner!.upsertSymbolsBatch(symbols);
   }
 
-  async getSymbolsByFile(filePath: string): Promise<SymbolData[]> {
+  async getSymbolsByFile(filePath: string, _sourceId?: string): Promise<SymbolData[]> {
     return this.inner!.getSymbolsByFile(filePath);
   }
 
@@ -310,7 +314,7 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     return this.inner!.getSymbolsByNameCi(name);
   }
 
-  async deleteSymbolsByFile(filePath: string): Promise<number> {
+  async deleteSymbolsByFile(filePath: string, _sourceId?: string): Promise<number> {
     return this.inner!.deleteSymbolsByFile(filePath);
   }
 
@@ -320,23 +324,23 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     this.inner!.upsertCallEdge(edge);
   }
 
-  async upsertCallEdgesBatch(edges: CallEdgeData[]): Promise<void> {
+  async upsertCallEdgesBatch(edges: CallEdgeData[], _sourceId?: string): Promise<void> {
     this.inner!.upsertCallEdgesBatch(edges);
   }
 
-  async getCallers(targetName: string, branch: string): Promise<CallEdgeData[]> {
+  async getCallers(targetName: string, branch: string, _sourceIds?: string[]): Promise<CallEdgeData[]> {
     return this.inner!.getCallers(targetName, branch);
   }
 
-  async getCallersWithContext(targetName: string, branch: string): Promise<CallEdgeData[]> {
+  async getCallersWithContext(targetName: string, branch: string, _sourceIds?: string[]): Promise<CallEdgeData[]> {
     return this.inner!.getCallersWithContext(targetName, branch);
   }
 
-  async getCallees(symbolId: string, branch: string): Promise<CallEdgeData[]> {
+  async getCallees(symbolId: string, branch: string, _sourceIds?: string[]): Promise<CallEdgeData[]> {
     return this.inner!.getCallees(symbolId, branch);
   }
 
-  async deleteCallEdgesByFile(filePath: string): Promise<number> {
+  async deleteCallEdgesByFile(filePath: string, _sourceId?: string): Promise<number> {
     return this.inner!.deleteCallEdgesByFile(filePath);
   }
 
@@ -350,15 +354,15 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     this.inner!.addSymbolsToBranch(branch, symbolIds);
   }
 
-  async addSymbolsToBranchBatch(branch: string, symbolIds: string[]): Promise<void> {
+  async addSymbolsToBranchBatch(branch: string, symbolIds: string[], _sourceId?: string): Promise<void> {
     this.inner!.addSymbolsToBranchBatch(branch, symbolIds);
   }
 
-  async getBranchSymbolIds(branch: string): Promise<string[]> {
+  async getBranchSymbolIds(branch: string, _sourceIds?: string[]): Promise<string[]> {
     return this.inner!.getBranchSymbolIds(branch);
   }
 
-  async clearBranchSymbols(branch: string): Promise<number> {
+  async clearBranchSymbols(branch: string, _sourceId?: string): Promise<number> {
     return this.inner!.clearBranchSymbols(branch);
   }
 
@@ -440,7 +444,7 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     return this.readFileHashesFromDisk();
   }
 
-  async setFileHashesBatch(hashes: Map<string, string>): Promise<void> {
+  async setFileHashesBatch(hashes: Map<string, string>, _sourceId?: string): Promise<void> {
     const existing = this.readFileHashesFromDisk();
     for (const [k, v] of hashes) existing.set(k, v);
     this.writeFileHashesToDisk(existing);
@@ -452,11 +456,11 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     this.writeFileHashesToDisk(hashes);
   }
 
-  async replaceAllFileHashes(hashes: Map<string, string>): Promise<void> {
+  async replaceAllFileHashes(hashes: Map<string, string>, _sourceId?: string): Promise<void> {
     this.writeFileHashesToDisk(hashes);
   }
 
-  async getFileHashBatch(filePaths: string[]): Promise<Map<string, string>> {
+  async getFileHashBatch(filePaths: string[], _sourceId?: string): Promise<Map<string, string>> {
     if (filePaths.length === 0) return new Map();
     const all = this.readFileHashesFromDisk();
     const result = new Map<string, string>();
@@ -467,28 +471,16 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     return result;
   }
 
-  async hasFileHashesOutsideRoots(roots: string[]): Promise<boolean> {
-    if (roots.length === 0) return false;
-    const all = this.readFileHashesFromDisk();
-    for (const fp of all.keys()) {
-      if (!roots.some((r) => isPathUnderRoot(fp, r))) return true;
-    }
-    return false;
+  async hasSourcesOtherThan(_sourceIds: string[]): Promise<boolean> {
+    return false; // SQLite is single-source by design
   }
 
-  async getFilePathsInRoots(roots: string[]): Promise<string[]> {
-    if (roots.length === 0) return [];
-    const all = this.readFileHashesFromDisk();
-    return Array.from(all.keys()).filter((fp) => roots.some((r) => isPathUnderRoot(fp, r)));
+  async getFilePathsBySource(_sourceId: string): Promise<string[]> {
+    return Array.from(this.readFileHashesFromDisk().keys());
   }
 
-  async deleteFileHashesInRoots(roots: string[]): Promise<void> {
-    if (roots.length === 0) return;
-    const hashes = this.readFileHashesFromDisk();
-    for (const fp of Array.from(hashes.keys())) {
-      if (roots.some((r) => isPathUnderRoot(fp, r))) hashes.delete(fp);
-    }
-    this.writeFileHashesToDisk(hashes);
+  async deleteFileHashesBySource(_sourceId: string): Promise<void> {
+    this.writeFileHashesToDisk(new Map());
   }
 
   // ── Inverted index (inverted-index.json) ──────────────────────────
@@ -541,7 +533,7 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
 
   // ── Inverted index search (handled by in-memory Rust struct for SQLite) ──
 
-  async searchBm25(_query: string, _limit: number): Promise<Map<string, number> | null> {
+  async searchBm25(_query: string, _limit: number, _sourceIds?: string[]): Promise<Map<string, number> | null> {
     return null; // caller falls back to this.invertedIndex.search()
   }
 }

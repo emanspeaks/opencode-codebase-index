@@ -42,13 +42,20 @@ export interface IVectorStoreBackend {
   /** Persist in-memory state to disk / remote.  No-op for pgvector. */
   save(): Promise<void>;
 
-  add(id: string, vector: number[], metadata: ChunkMetadata): Promise<void>;
+  add(id: string, vector: number[], metadata: ChunkMetadata, sourceId?: string): Promise<void>;
 
   addBatch(
-    items: Array<{ id: string; vector: number[]; metadata: ChunkMetadata }>
+    items: Array<{ id: string; vector: number[]; metadata: ChunkMetadata }>,
+    sourceId?: string
   ): Promise<void>;
 
-  search(queryVector: number[], limit: number): Promise<VectorSearchResult[]>;
+  /**
+   * Search for nearest neighbours.
+   * @param sourceIds  When provided, restrict results to chunks belonging to
+   *                   these sources.  Ignored by the SQLite backend (single-
+   *                   project files have no cross-source ambiguity).
+   */
+  search(queryVector: number[], limit: number, sourceIds?: string[]): Promise<VectorSearchResult[]>;
 
   remove(id: string): Promise<boolean>;
 
@@ -85,6 +92,21 @@ export interface IDatabaseBackend {
   /** Close any open connections / file handles. */
   close(): Promise<void>;
 
+  /**
+   * Whether this backend supports per-source isolation via source IDs.
+   * pgvector returns true; SQLite returns false (single-project-per-file,
+   * isolation is handled by the projectHash:branch catalog key instead).
+   */
+  supportsSourceIsolation(): boolean;
+
+  /**
+   * Register or retrieve a source (project root or knowledge-base root).
+   * Returns a stable source ID (hash of rootPath) that is used to tag all
+   * data written by that source.
+   * No-op on SQLite (returns hash of rootPath without persisting).
+   */
+  getOrCreateSource(rootPath: string): Promise<string>;
+
   // ── Embeddings ──────────────────────────────────────────────────
 
   embeddingExists(contentHash: string): Promise<boolean>;
@@ -113,34 +135,46 @@ export interface IDatabaseBackend {
 
   upsertChunk(chunk: ChunkData): Promise<void>;
 
-  upsertChunksBatch(chunks: ChunkData[]): Promise<void>;
+  /** @param sourceId  Ignored by SQLite (no Rust-layer column yet). Defaults to '' when omitted. */
+  upsertChunksBatch(chunks: ChunkData[], sourceId?: string): Promise<void>;
 
   getChunk(chunkId: string): Promise<ChunkData | null>;
 
-  getChunksByFile(filePath: string): Promise<ChunkData[]>;
+  /** @param sourceId  Ignored by SQLite. Omit to return chunks from all sources. */
+  getChunksByFile(filePath: string, sourceId?: string): Promise<ChunkData[]>;
 
   getChunksByName(name: string): Promise<ChunkData[]>;
 
   getChunksByNameCi(name: string): Promise<ChunkData[]>;
 
-  deleteChunksByFile(filePath: string): Promise<number>;
+  /** @param sourceId  Ignored by SQLite. Omit to delete across all sources. */
+  deleteChunksByFile(filePath: string, sourceId?: string): Promise<number>;
 
-  /** All distinct file paths that have at least one chunk stored. */
-  getChunkFilePaths(): Promise<string[]>;
+  /**
+   * All distinct file paths that have at least one chunk stored.
+   * @param sourceId  Scoped to this source. Ignored by SQLite (returns all paths). Omit for all sources.
+   */
+  getChunkFilePaths(sourceId?: string): Promise<string[]>;
 
   // ── Branch catalog ───────────────────────────────────────────────
 
   addChunksToBranch(branch: string, chunkIds: string[]): Promise<void>;
 
-  addChunksToBranchBatch(branch: string, chunkIds: string[]): Promise<void>;
+  /** @param sourceId  Ignored by SQLite (branch key encodes project identity). Defaults to '' when omitted. */
+  addChunksToBranchBatch(branch: string, chunkIds: string[], sourceId?: string): Promise<void>;
 
-  clearBranch(branch: string): Promise<number>;
+  /** @param sourceId  Ignored by SQLite. Omit to clear across all sources. */
+  clearBranch(branch: string, sourceId?: string): Promise<number>;
 
   deleteBranchChunksByChunkIds(chunkIds: string[]): Promise<number>;
 
   deleteBranchChunksForBranch(branch: string, chunkIds: string[]): Promise<number>;
 
-  getBranchChunkIds(branch: string): Promise<string[]>;
+  /**
+   * IDs of chunks on this branch, optionally restricted to given sources.
+   * @param sourceIds  Ignored by SQLite.
+   */
+  getBranchChunkIds(branch: string, sourceIds?: string[]): Promise<string[]>;
 
   getBranchDelta(branch: string, baseBranch: string): Promise<BranchDelta>;
 
@@ -174,9 +208,11 @@ export interface IDatabaseBackend {
 
   upsertSymbol(symbol: SymbolData): Promise<void>;
 
-  upsertSymbolsBatch(symbols: SymbolData[]): Promise<void>;
+  /** @param sourceId  Ignored by SQLite. Defaults to '' when omitted. */
+  upsertSymbolsBatch(symbols: SymbolData[], sourceId?: string): Promise<void>;
 
-  getSymbolsByFile(filePath: string): Promise<SymbolData[]>;
+  /** @param sourceId  Ignored by SQLite. Omit to return symbols from all sources. */
+  getSymbolsByFile(filePath: string, sourceId?: string): Promise<SymbolData[]>;
 
   getSymbolByName(name: string, filePath: string): Promise<SymbolData | null>;
 
@@ -184,21 +220,27 @@ export interface IDatabaseBackend {
 
   getSymbolsByNameCi(name: string): Promise<SymbolData[]>;
 
-  deleteSymbolsByFile(filePath: string): Promise<number>;
+  /** @param sourceId  Ignored by SQLite. Omit to delete across all sources. */
+  deleteSymbolsByFile(filePath: string, sourceId?: string): Promise<number>;
 
   // ── Call edges ───────────────────────────────────────────────────
 
   upsertCallEdge(edge: CallEdgeData): Promise<void>;
 
-  upsertCallEdgesBatch(edges: CallEdgeData[]): Promise<void>;
+  /** @param sourceId  Ignored by SQLite. Defaults to '' when omitted. */
+  upsertCallEdgesBatch(edges: CallEdgeData[], sourceId?: string): Promise<void>;
 
-  getCallers(targetName: string, branch: string): Promise<CallEdgeData[]>;
+  /** @param sourceIds  Ignored by SQLite. */
+  getCallers(targetName: string, branch: string, sourceIds?: string[]): Promise<CallEdgeData[]>;
 
-  getCallersWithContext(targetName: string, branch: string): Promise<CallEdgeData[]>;
+  /** @param sourceIds  Ignored by SQLite. */
+  getCallersWithContext(targetName: string, branch: string, sourceIds?: string[]): Promise<CallEdgeData[]>;
 
-  getCallees(symbolId: string, branch: string): Promise<CallEdgeData[]>;
+  /** @param sourceIds  Ignored by SQLite. */
+  getCallees(symbolId: string, branch: string, sourceIds?: string[]): Promise<CallEdgeData[]>;
 
-  deleteCallEdgesByFile(filePath: string): Promise<number>;
+  /** @param sourceId  Ignored by SQLite. Omit to delete across all sources. */
+  deleteCallEdgesByFile(filePath: string, sourceId?: string): Promise<number>;
 
   resolveCallEdge(edgeId: string, toSymbolId: string): Promise<void>;
 
@@ -206,11 +248,16 @@ export interface IDatabaseBackend {
 
   addSymbolsToBranch(branch: string, symbolIds: string[]): Promise<void>;
 
-  addSymbolsToBranchBatch(branch: string, symbolIds: string[]): Promise<void>;
+  /** @param sourceId  Ignored by SQLite. Defaults to '' when omitted. */
+  addSymbolsToBranchBatch(branch: string, symbolIds: string[], sourceId?: string): Promise<void>;
 
-  getBranchSymbolIds(branch: string): Promise<string[]>;
+  /**
+   * @param sourceIds  Ignored by SQLite.
+   */
+  getBranchSymbolIds(branch: string, sourceIds?: string[]): Promise<string[]>;
 
-  clearBranchSymbols(branch: string): Promise<number>;
+  /** @param sourceId  Ignored by SQLite. Omit to clear across all sources. */
+  clearBranchSymbols(branch: string, sourceId?: string): Promise<number>;
 
   getReferencedSymbolIds(symbolIds: string[]): Promise<string[]>;
 
@@ -234,24 +281,31 @@ export interface IDatabaseBackend {
 
   getAllFileHashes(): Promise<Map<string, string>>;
 
-  setFileHashesBatch(hashes: Map<string, string>): Promise<void>;
+  /** @param sourceId  Scopes the batch to this source. Defaults to '' when omitted. */
+  setFileHashesBatch(hashes: Map<string, string>, sourceId?: string): Promise<void>;
 
   deleteFileHashesBatch(filePaths: string[]): Promise<void>;
 
-  /** Atomically replace the entire file-hash store with the given map. */
-  replaceAllFileHashes(hashes: Map<string, string>): Promise<void>;
+  /**
+   * Atomically replace the file-hash store for one source.
+   * @param sourceId  Scopes the replacement to this source only. Defaults to '' when omitted.
+   */
+  replaceAllFileHashes(hashes: Map<string, string>, sourceId?: string): Promise<void>;
 
-  /** Fetch stored hashes for only the given paths (avoids a full table load). */
-  getFileHashBatch(filePaths: string[]): Promise<Map<string, string>>;
+  /** Fetch stored hashes for the given paths scoped to one source. Defaults to '' when omitted. */
+  getFileHashBatch(filePaths: string[], sourceId?: string): Promise<Map<string, string>>;
 
-  /** True if the store contains any path not under any of the given roots. */
-  hasFileHashesOutsideRoots(roots: string[]): Promise<boolean>;
+  /**
+   * True if there are file hashes belonging to sources other than those listed.
+   * Used to detect foreign data in a shared DB.  SQLite always returns false.
+   */
+  hasSourcesOtherThan(sourceIds: string[]): Promise<boolean>;
 
-  /** All stored paths that fall under at least one of the given roots. */
-  getFilePathsInRoots(roots: string[]): Promise<string[]>;
+  /** All stored file paths for the given source. */
+  getFilePathsBySource(sourceId: string): Promise<string[]>;
 
-  /** Delete every hash record whose path is under any of the given roots. */
-  deleteFileHashesInRoots(roots: string[]): Promise<void>;
+  /** Delete all file hash records for the given source. */
+  deleteFileHashesBySource(sourceId: string): Promise<void>;
 
   // ── Inverted index ───────────────────────────────────────────────
 
@@ -261,8 +315,8 @@ export interface IDatabaseBackend {
 
   /**
    * Incrementally upsert posting data for a batch of chunks.
-   * For pgvector: writes directly to the posting tables (term, chunk_id, token_count)
-   * and doc_lengths table. For SQLite: no-op (in-memory Rust struct is authoritative).
+   * For pgvector: writes directly to the posting tables.
+   * For SQLite: no-op (in-memory Rust struct is authoritative).
    */
   upsertInvertedIndexChunkBatch(entries: Array<{ chunkId: string; content: string }>): Promise<void>;
 
@@ -276,9 +330,9 @@ export interface IDatabaseBackend {
   /**
    * BM25 keyword search against the persisted inverted index.
    * Returns null for SQLite (caller uses the in-memory Rust struct instead).
-   * pgvector returns scored results directly from the DB.
+   * @param sourceIds  Restrict results to these sources.  Ignored by SQLite.
    */
-  searchBm25(query: string, limit: number): Promise<Map<string, number> | null>;
+  searchBm25(query: string, limit: number, sourceIds?: string[]): Promise<Map<string, number> | null>;
 
   // ── Indexing lock ────────────────────────────────────────────────
 
