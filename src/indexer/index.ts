@@ -281,6 +281,16 @@ interface IndexCompatibility {
 const INDEX_METADATA_VERSION = "1";
 const EMBEDDING_STRATEGY_VERSION = "2";
 const RANKING_TOKEN_CACHE_LIMIT = 4096;
+const CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000;
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
 
 function createPendingChunkStorageText(texts: PendingChunk["texts"]): string {
   const primaryText = texts[0]?.text ?? "";
@@ -2341,8 +2351,11 @@ export class Indexer {
     };
   }
 
-  private async checkForInterruptedIndexing(): Promise<boolean> {
-    return this.database!.isLocked();
+  private async checkForInterruptedIndexing(): Promise<"none" | "stale" | "active"> {
+    const lockInfo = await this.database!.getLockInfo();
+    if (!lockInfo) return "none";
+    if (!isPidAlive(lockInfo.pid)) return "stale";
+    return "active";
   }
 
   private async acquireIndexingLock(): Promise<void> {
@@ -2357,11 +2370,10 @@ export class Indexer {
   }
 
   private async recoverFromInterruptedIndexing(): Promise<void> {
-    this.logger.warn("Detected interrupted indexing session, recovering...");
-    await this.database!.replaceAllFileHashes(new Map());
+    this.logger.warn("Detected stale lock from crashed/killed process, recovering...");
     await this.healthCheck();
     await this.releaseIndexingLock();
-    this.logger.info("Recovery complete, next index will re-process all files");
+    this.logger.info("Lock cleared; previously completed file batches will be skipped on next index");
   }
 
   private loadFailedBatches(maxChunkTokens?: number): FailedBatch[] {
@@ -2815,7 +2827,8 @@ export class Indexer {
     // are all initialized. healthCheck() calls ensureInitialized() which checks
     // these fields — if they're not set, it re-enters initialize() causing infinite
     // recursion and 70GB+ memory usage.
-    if (await this.checkForInterruptedIndexing()) {
+    const lockState = await this.checkForInterruptedIndexing();
+    if (lockState === "stale") {
       await this.recoverFromInterruptedIndexing();
     }
 
@@ -3144,6 +3157,7 @@ export class Indexer {
     this.embeddingPhaseStartTime = 0;
     this.embeddingChunksAtStart = 0;
     this.lastProgressPersistAt = 0;
+    let lastCheckpointAt = 0;
     this.logger.recordIndexingStart();
     this.logger.info("Starting indexing", { projectRoot: this.projectRoot });
 
@@ -3225,11 +3239,13 @@ export class Indexer {
       if (!currentFilePathSet.has(fp)) {
         if (scopedRoots && !this.isFileInCurrentScope(fp, scopedRoots)) continue;
         const oldChunks = await this.database!.getChunksByFile(fp);
-        for (const chunk of oldChunks) {
-          await store.remove(chunk.chunkId);
-          invertedIndex.removeChunk(chunk.chunkId);
+        const oldChunkIds = oldChunks.map(c => c.chunkId);
+        for (const chunkId of oldChunkIds) {
+          await store.remove(chunkId);
+          invertedIndex.removeChunk(chunkId);
           removedCount++;
         }
+        await database.deleteInvertedIndexChunkBatch(oldChunkIds);
       }
     }
 
@@ -3275,6 +3291,7 @@ export class Indexer {
       });
       this.logger.recordChunksFromCache(chunksWithExistingEmbedding.length);
 
+      const existingEmbeddingEntries: Array<{ chunkId: string; content: string }> = [];
       for (const chunk of chunksWithExistingEmbedding) {
         const embeddingBuffer = await database.getEmbedding(chunk.contentHash);
         if (embeddingBuffer) {
@@ -3282,9 +3299,11 @@ export class Indexer {
           await store.add(chunk.id, Array.from(vector), chunk.metadata);
           invertedIndex.removeChunk(chunk.id);
           invertedIndex.addChunk(chunk.id, chunk.content);
+          existingEmbeddingEntries.push({ chunkId: chunk.id, content: chunk.content });
           stats.indexedChunks++;
         }
       }
+      await database.upsertInvertedIndexChunkBatch(existingEmbeddingEntries);
 
       const pendingChunksById = new Map(chunksNeedingEmbedding.map((c) => [c.id, c]));
       const embeddingPartsByChunk = new Map<string, Array<{ vector: number[]; tokenCount: number } | undefined>>();
@@ -3354,6 +3373,9 @@ export class Indexer {
               });
               embeddingPartsByChunk.delete(chunkId);
             }
+            await database.upsertInvertedIndexChunkBatch(
+              batch.map(c => ({ chunkId: c.id, content: c.content }))
+            );
 
             if (pooledResults.length > 0) {
               const items = pooledResults.map(({ chunk, vector }) => ({
@@ -3524,12 +3546,17 @@ export class Indexer {
         }
 
         // Per-file orphan removal (chunks no longer produced by re-parsing)
+        const orphanedChunkIds: string[] = [];
         for (const [oldChunkId] of existingChunkHashes) {
           if (!newChunkIdsForFile.has(oldChunkId)) {
             await store.remove(oldChunkId);
             invertedIndex.removeChunk(oldChunkId);
+            orphanedChunkIds.push(oldChunkId);
             removedCount++;
           }
+        }
+        if (orphanedChunkIds.length > 0) {
+          await database.deleteInvertedIndexChunkBatch(orphanedChunkIds);
         }
 
         // Call graph extraction for this file
@@ -3623,6 +3650,19 @@ export class Indexer {
 
       // Embed this batch; queue.onIdle() ensures we don't accumulate unbounded pending chunks
       await embedPendingChunks(batchPendingChunks);
+
+      // Write hashes for this batch immediately so crash recovery can skip already-processed files
+      await this.database!.setFileHashesBatch(new Map(fileBatch.map(f => [f.path, f.hash])));
+
+      // Periodically flush the vector store so crash recovery can skip already-processed files
+      // without re-adding their vectors. store.save() is a no-op for pgvector (already durable).
+      // The inverted index is kept current per-chunk via upsertInvertedIndexChunkBatch above.
+      const now = Date.now();
+      if (now - lastCheckpointAt >= CHECKPOINT_INTERVAL_MS) {
+        lastCheckpointAt = now;
+        await store.save();
+        this.logger.debug("Checkpoint: flushed vector store");
+      }
 
       this.updateProgress({
         phase: "parsing",

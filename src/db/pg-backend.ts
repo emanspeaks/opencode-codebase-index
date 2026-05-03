@@ -1403,71 +1403,103 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.length > 0;
   }
 
+  async getLockInfo(): Promise<{ pid: number; startedAt: string } | null> {
+    const pool = await this.getPool();
+    const { rows } = await pool.query<{ value: string }>(
+      `SELECT value FROM ${this.t("metadata")} WHERE key = 'indexing_lock'`
+    );
+    if (rows.length === 0) return null;
+    try {
+      return JSON.parse(rows[0].value) as { pid: number; startedAt: string };
+    } catch {
+      return null;
+    }
+  }
+
   // ── Inverted index (structured tables + SQL BM25) ────────────────
 
   /**
-   * Parse the Rust-serialized JSON and sync the full posting list to the DB.
-   * Replaces the entire table atomically so searches are always consistent.
+   * No-op for pgvector: posting tables are kept current by
+   * upsertInvertedIndexChunkBatch / deleteInvertedIndexChunkBatch as each
+   * chunk is processed, so there is nothing to bulk-sync at run end.
+   * The json argument (from the in-memory Rust struct) is intentionally ignored.
    */
-  async saveInvertedIndex(json: string): Promise<void> {
-    type IndexData = {
-      term_to_chunks: Record<string, string[]>;
-      chunk_tokens: Record<string, Record<string, number>>;
-      avg_doc_length: number;
-    };
-    const data: IndexData = JSON.parse(json);
-
-    // Compute per-chunk doc lengths from chunk_tokens
-    const docLengths = new Map<string, number>();
-    for (const [chunkId, tokens] of Object.entries(data.chunk_tokens)) {
-      const len = Object.values(tokens).reduce((s, n) => s + n, 0);
-      docLengths.set(chunkId, len);
-    }
-
-    await this.withClient(async (client) => {
-      await client.query("BEGIN");
-      await client.query(`TRUNCATE TABLE ${this.t("inverted_index_postings")}`);
-      await client.query(`TRUNCATE TABLE ${this.t("inverted_index_doc_lengths")}`);
-
-      // Batch insert postings
-      const postingRows: Array<[string, string, number]> = [];
-      for (const [term, chunkIds] of Object.entries(data.term_to_chunks)) {
-        for (const chunkId of chunkIds) {
-          const count = data.chunk_tokens[chunkId]?.[term] ?? 1;
-          postingRows.push([term, chunkId, count]);
-        }
-      }
-      // Insert in chunks to avoid overly large statements
-      const BATCH = 500;
-      for (let i = 0; i < postingRows.length; i += BATCH) {
-        const slice = postingRows.slice(i, i + BATCH);
-        const placeholders = slice.map((_, j) => `($${j * 3 + 1},$${j * 3 + 2},$${j * 3 + 3})`).join(",");
-        const values = slice.flat();
-        await client.query(
-          `INSERT INTO ${this.t("inverted_index_postings")} (term, chunk_id, token_count) VALUES ${placeholders}`,
-          values
-        );
-      }
-
-      // Insert doc lengths
-      const dlRows = Array.from(docLengths.entries());
-      for (let i = 0; i < dlRows.length; i += BATCH) {
-        const slice = dlRows.slice(i, i + BATCH);
-        const placeholders = slice.map((_, j) => `($${j * 2 + 1},$${j * 2 + 2})`).join(",");
-        const values = slice.flat();
-        await client.query(
-          `INSERT INTO ${this.t("inverted_index_doc_lengths")} (chunk_id, doc_len) VALUES ${placeholders}`,
-          values
-        );
-      }
-
-      await client.query("COMMIT");
-    });
-  }
+  async saveInvertedIndex(_json: string): Promise<void> {}
 
   /** For pgvector, always skip loading the Rust in-memory struct — SQL BM25 is used for search. */
   async loadInvertedIndex(): Promise<string | null> {
     return null;
+  }
+
+  async upsertInvertedIndexChunkBatch(entries: Array<{ chunkId: string; content: string }>): Promise<void> {
+    if (entries.length === 0) return;
+
+    const postingRows: Array<[string, string, number]> = [];
+    const docLengthRows: Array<[string, number]> = [];
+
+    for (const { chunkId, content } of entries) {
+      const termCounts = new Map<string, number>();
+      for (const term of tokenizeText(content)) {
+        termCounts.set(term, (termCounts.get(term) ?? 0) + 1);
+      }
+      let docLen = 0;
+      for (const [term, count] of termCounts) {
+        postingRows.push([term, chunkId, count]);
+        docLen += count;
+      }
+      docLengthRows.push([chunkId, docLen]);
+    }
+
+    const BATCH = 500;
+    const pool = await this.getPool();
+
+    // Upsert doc lengths
+    for (let i = 0; i < docLengthRows.length; i += BATCH) {
+      const slice = docLengthRows.slice(i, i + BATCH);
+      const placeholders = slice.map((_, j) => `($${j * 2 + 1},$${j * 2 + 2})`).join(",");
+      await pool.query(
+        `INSERT INTO ${this.t("inverted_index_doc_lengths")} (chunk_id, doc_len) VALUES ${placeholders}
+         ON CONFLICT (chunk_id) DO UPDATE SET doc_len = EXCLUDED.doc_len`,
+        slice.flat()
+      );
+    }
+
+    // Delete old postings for these chunks, then insert fresh ones
+    const chunkIds = entries.map(e => e.chunkId);
+    for (let i = 0; i < chunkIds.length; i += BATCH) {
+      const slice = chunkIds.slice(i, i + BATCH);
+      const placeholders = slice.map((_, j) => `$${j + 1}`).join(",");
+      await pool.query(
+        `DELETE FROM ${this.t("inverted_index_postings")} WHERE chunk_id IN (${placeholders})`,
+        slice
+      );
+    }
+    for (let i = 0; i < postingRows.length; i += BATCH) {
+      const slice = postingRows.slice(i, i + BATCH);
+      const placeholders = slice.map((_, j) => `($${j * 3 + 1},$${j * 3 + 2},$${j * 3 + 3})`).join(",");
+      await pool.query(
+        `INSERT INTO ${this.t("inverted_index_postings")} (term, chunk_id, token_count) VALUES ${placeholders}`,
+        slice.flat()
+      );
+    }
+  }
+
+  async deleteInvertedIndexChunkBatch(chunkIds: string[]): Promise<void> {
+    if (chunkIds.length === 0) return;
+    const pool = await this.getPool();
+    const BATCH = 500;
+    for (let i = 0; i < chunkIds.length; i += BATCH) {
+      const slice = chunkIds.slice(i, i + BATCH);
+      const placeholders = slice.map((_, j) => `$${j + 1}`).join(",");
+      await pool.query(
+        `DELETE FROM ${this.t("inverted_index_postings")} WHERE chunk_id IN (${placeholders})`,
+        slice
+      );
+      await pool.query(
+        `DELETE FROM ${this.t("inverted_index_doc_lengths")} WHERE chunk_id IN (${placeholders})`,
+        slice
+      );
+    }
   }
 
   async searchBm25(query: string, limit: number): Promise<Map<string, number> | null> {

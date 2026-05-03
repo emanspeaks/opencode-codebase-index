@@ -507,6 +507,10 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     }
   }
 
+  // In-memory Rust struct is authoritative for SQLite BM25; no DB tables to update.
+  async upsertInvertedIndexChunkBatch(_entries: Array<{ chunkId: string; content: string }>): Promise<void> {}
+  async deleteInvertedIndexChunkBatch(_chunkIds: string[]): Promise<void> {}
+
   // ── Indexing lock (indexing.lock) ─────────────────────────────────
 
   async tryAcquireLock(pid: number, startedAt: string): Promise<boolean> {
@@ -523,6 +527,16 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
 
   async isLocked(): Promise<boolean> {
     return existsSync(this.lockFilePath());
+  }
+
+  async getLockInfo(): Promise<{ pid: number; startedAt: string } | null> {
+    const lockPath = this.lockFilePath();
+    if (!existsSync(lockPath)) return null;
+    try {
+      return JSON.parse(readFileSync(lockPath, "utf-8")) as { pid: number; startedAt: string };
+    } catch {
+      return null;
+    }
   }
 
   // ── Inverted index search (handled by in-memory Rust struct for SQLite) ──

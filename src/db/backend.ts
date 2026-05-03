@@ -260,6 +260,20 @@ export interface IDatabaseBackend {
   loadInvertedIndex(): Promise<string | null>;
 
   /**
+   * Incrementally upsert posting data for a batch of chunks.
+   * For pgvector: writes directly to the posting tables (term, chunk_id, token_count)
+   * and doc_lengths table. For SQLite: no-op (in-memory Rust struct is authoritative).
+   */
+  upsertInvertedIndexChunkBatch(entries: Array<{ chunkId: string; content: string }>): Promise<void>;
+
+  /**
+   * Remove posting data for a batch of chunk IDs.
+   * For pgvector: deletes from posting and doc_lengths tables.
+   * For SQLite: no-op.
+   */
+  deleteInvertedIndexChunkBatch(chunkIds: string[]): Promise<void>;
+
+  /**
    * BM25 keyword search against the persisted inverted index.
    * Returns null for SQLite (caller uses the in-memory Rust struct instead).
    * pgvector returns scored results directly from the DB.
@@ -273,4 +287,6 @@ export interface IDatabaseBackend {
   releaseLock(): Promise<void>;
 
   isLocked(): Promise<boolean>;
+
+  getLockInfo(): Promise<{ pid: number; startedAt: string } | null>;
 }
