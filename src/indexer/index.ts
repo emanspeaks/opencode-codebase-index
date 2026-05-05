@@ -3710,13 +3710,310 @@ export class Indexer {
     // Phase 7: Finalization
     stats.removedChunks = removedCount;
 
+<<<<<<< HEAD
+=======
+    if (pendingChunks.length === 0) {
+      database.clearBranch(branchCatalogKey);
+      database.addChunksToBranchBatch(branchCatalogKey, Array.from(currentChunkIds));
+      database.clearBranchSymbols(branchCatalogKey);
+      database.addSymbolsToBranchBatch(branchCatalogKey, Array.from(allSymbolIds));
+      store.save();
+      invertedIndex.save();
+      if (scopedRoots) {
+        this.replaceScopedFileHashCache(currentFileHashes, scopedRoots);
+        this.clearScopedFailedBatches(scopedRoots);
+      } else {
+        this.fileHashCache = currentFileHashes;
+        this.saveFileHashCache();
+        this.saveFailedBatches([]);
+      }
+      this.saveIndexMetadata(configuredProviderInfo);
+      this.indexCompatibility = { compatible: true };
+      stats.durationMs = Date.now() - startTime;
+      onProgress?.({
+        phase: "complete",
+        filesProcessed: files.length,
+        totalFiles: files.length,
+        chunksProcessed: 0,
+        totalChunks: 0,
+      });
+      this.releaseIndexingLock();
+      return stats;
+    }
+
+    onProgress?.({
+      phase: "embedding",
+      filesProcessed: files.length,
+      totalFiles: files.length,
+      chunksProcessed: 0,
+      totalChunks: pendingChunks.length,
+    });
+
+    const allContentHashes = pendingChunks.map((c) => c.contentHash);
+    const missingHashes = new Set(database.getMissingEmbeddings(allContentHashes));
+    const forcedReembedChunkIds = forceScopedReembed
+      ? new Set(pendingChunks.map((chunk) => chunk.id))
+      : new Set<string>();
+
+    const chunksNeedingEmbedding = pendingChunks.filter((c) => forcedReembedChunkIds.has(c.id) || missingHashes.has(c.contentHash));
+    const chunksWithExistingEmbedding = pendingChunks.filter((c) => !forcedReembedChunkIds.has(c.id) && !missingHashes.has(c.contentHash));
+
+    this.logger.cache("info", "Embedding cache lookup", {
+      needsEmbedding: chunksNeedingEmbedding.length,
+      fromCache: chunksWithExistingEmbedding.length,
+    });
+    this.logger.recordChunksFromCache(chunksWithExistingEmbedding.length);
+
+    for (const chunk of chunksWithExistingEmbedding) {
+      const embeddingBuffer = database.getEmbedding(chunk.contentHash);
+      if (embeddingBuffer) {
+        const vector = bufferToFloat32Array(embeddingBuffer);
+        store.add(chunk.id, Array.from(vector), chunk.metadata);
+        invertedIndex.removeChunk(chunk.id);
+        invertedIndex.addChunk(chunk.id, chunk.content);
+        stats.indexedChunks++;
+      }
+    }
+
+    const providerRateLimits = this.getProviderRateLimits(configuredProviderInfo.provider);
+    const queue = new PQueue({
+      concurrency: providerRateLimits.concurrency,
+      interval: providerRateLimits.intervalMs,
+      intervalCap: providerRateLimits.concurrency
+    });
+    const pendingChunksById = new Map(chunksNeedingEmbedding.map((chunk) => [chunk.id, chunk]));
+    const embeddingPartsByChunk = new Map<string, Array<{ vector: number[]; tokenCount: number } | undefined>>();
+    const completedChunkIds = new Set<string>();
+    const failedChunkIds = new Set<string>();
+    const requestBatches = createPendingEmbeddingRequestBatches(
+      chunksNeedingEmbedding,
+      getDynamicBatchOptions(configuredProviderInfo)
+    );
+    let rateLimitBackoffMs = 0;
+
+    for (const requestBatch of requestBatches) {
+      queue.add(async () => {
+        if (rateLimitBackoffMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, rateLimitBackoffMs));
+        }
+
+        try {
+          let failedAttemptsForRequest = 0;
+          const result = await pRetry(
+            async () => {
+              const texts = requestBatch.map((request) => request.text);
+              return provider.embedBatch(texts);
+            },
+            {
+              retries: this.config.indexing.retries,
+              minTimeout: Math.max(this.config.indexing.retryDelayMs, providerRateLimits.minRetryMs),
+              maxTimeout: providerRateLimits.maxRetryMs,
+              factor: 2,
+              shouldRetry: (error) => !((error as { error?: Error }).error instanceof CustomProviderNonRetryableError),
+              onFailedAttempt: (error) => {
+                const message = getErrorMessage(error);
+                if (isRateLimitError(error)) {
+                  rateLimitBackoffMs = Math.min(providerRateLimits.maxRetryMs, (rateLimitBackoffMs || providerRateLimits.minRetryMs) * 2);
+                  this.logger.embedding("warn", `Rate limited, backing off`, {
+                    attempt: error.attemptNumber,
+                    retriesLeft: error.retriesLeft,
+                    backoffMs: rateLimitBackoffMs,
+                  });
+                } else {
+                  failedAttemptsForRequest += 1;
+                  this.logger.embedding("warn", `Embedding batch attempt failed; retry scheduled`, {
+                    attempt: error.attemptNumber,
+                    retriesLeft: error.retriesLeft,
+                    willRetry: error.retriesLeft > 0,
+                    error: message,
+                  });
+                }
+              },
+            }
+          );
+
+          if (failedAttemptsForRequest > 0) {
+            this.logger.embedding("warn", `Embedding batch succeeded after retry`, {
+              failedAttempts: failedAttemptsForRequest,
+              successfulAttempt: failedAttemptsForRequest + 1,
+              requestCount: requestBatch.length,
+            });
+          }
+
+          if (rateLimitBackoffMs > 0) {
+            rateLimitBackoffMs = Math.max(0, rateLimitBackoffMs - 2000);
+          }
+
+          const touchedChunkIds = new Set<string>();
+
+          requestBatch.forEach((request, idx) => {
+            if (failedChunkIds.has(request.chunk.id) || completedChunkIds.has(request.chunk.id)) {
+              return;
+            }
+
+            const vector = result.embeddings[idx];
+            if (!vector) {
+              throw new Error(`Embedding API returned too few vectors for chunk ${request.chunk.id}`);
+            }
+
+            const parts = embeddingPartsByChunk.get(request.chunk.id) ?? [];
+            parts[request.partIndex] = {
+              vector,
+              tokenCount: request.tokenCount,
+            };
+            embeddingPartsByChunk.set(request.chunk.id, parts);
+            touchedChunkIds.add(request.chunk.id);
+          });
+
+          const pooledResults: Array<{ chunk: PendingChunk; vector: number[] }> = [];
+          for (const chunkId of touchedChunkIds) {
+            if (failedChunkIds.has(chunkId) || completedChunkIds.has(chunkId)) {
+              continue;
+            }
+
+            const chunk = pendingChunksById.get(chunkId);
+            if (!chunk) {
+              continue;
+            }
+
+            const parts = embeddingPartsByChunk.get(chunk.id) ?? [];
+            if (!hasAllEmbeddingParts(parts, chunk.texts.length)) {
+              continue;
+            }
+
+            const orderedParts = parts as Array<{ vector: number[]; tokenCount: number }>;
+            pooledResults.push({
+              chunk,
+              vector: poolEmbeddingVectors(
+                orderedParts.map((part) => part.vector),
+                orderedParts.map((part) => part.tokenCount)
+              ),
+            });
+          }
+
+          if (pooledResults.length > 0) {
+            const items = pooledResults.map(({ chunk, vector }) => ({
+              id: chunk.id,
+              vector,
+              metadata: chunk.metadata,
+            }));
+
+            store.addBatch(items);
+
+            const embeddingBatchItems = pooledResults.map(({ chunk, vector }) => ({
+              contentHash: chunk.contentHash,
+              embedding: float32ArrayToBuffer(vector),
+              chunkText: chunk.storageText,
+              model: configuredProviderInfo.modelInfo.model,
+            }));
+
+            try {
+              database.upsertEmbeddingsBatch(embeddingBatchItems);
+            } catch (dbError) {
+              // Rollback vectors added to store if DB write fails
+              for (const { chunk } of pooledResults) {
+                store.remove(chunk.id);
+              }
+              throw dbError;
+            }
+
+            for (const { chunk } of pooledResults) {
+              invertedIndex.removeChunk(chunk.id);
+              invertedIndex.addChunk(chunk.id, chunk.content);
+              completedChunkIds.add(chunk.id);
+              embeddingPartsByChunk.delete(chunk.id);
+            }
+
+            stats.indexedChunks += pooledResults.length;
+            this.logger.recordChunksEmbedded(pooledResults.length);
+          }
+
+          stats.tokensUsed += result.totalTokensUsed;
+
+          this.logger.recordEmbeddingApiCall(result.totalTokensUsed);
+          this.logger.embedding("debug", `Embedded batch`, {
+            batchSize: pooledResults.length,
+            requestCount: requestBatch.length,
+            tokens: result.totalTokensUsed,
+          });
+
+          onProgress?.({
+            phase: "embedding",
+            filesProcessed: files.length,
+            totalFiles: files.length,
+            chunksProcessed: stats.indexedChunks,
+            totalChunks: pendingChunks.length,
+          });
+        } catch (error) {
+          const failedChunks = getUniquePendingChunksFromRequests(requestBatch)
+            .filter((chunk) => !completedChunkIds.has(chunk.id));
+          const failureMessage = getErrorMessage(error);
+          const failureTimestamp = new Date().toISOString();
+
+          for (const chunk of failedChunks) {
+            if (!failedChunkIds.has(chunk.id)) {
+              failedChunkIds.add(chunk.id);
+              stats.failedChunks += 1;
+            }
+
+            if (forceScopedReembed) {
+              failedForcedChunkIds.add(chunk.id);
+            }
+
+            embeddingPartsByChunk.delete(chunk.id);
+
+            const existingFailedBatchIndex = failedBatchesForCurrentRun.findIndex(
+              (failedBatch) => failedBatch.chunks[0]?.id === chunk.id
+            );
+            const existingFailedBatch = existingFailedBatchIndex === -1
+              ? undefined
+              : failedBatchesForCurrentRun[existingFailedBatchIndex];
+            const failedBatch = {
+              chunks: [chunk],
+              error: failureMessage,
+              attemptCount: (existingFailedBatch?.attemptCount ?? retryableFailedAttemptCounts.get(chunk.id) ?? 0) + 1,
+              lastAttempt: failureTimestamp,
+            } satisfies FailedBatch;
+
+            if (existingFailedBatchIndex === -1) {
+              failedBatchesForCurrentRun.push(failedBatch);
+            } else {
+              failedBatchesForCurrentRun[existingFailedBatchIndex] = failedBatch;
+            }
+          }
+
+          this.logger.recordEmbeddingError();
+          this.logger.embedding("error", `Failed to embed batch after retries`, {
+            batchSize: failedChunks.length,
+            requestCount: requestBatch.length,
+            error: failureMessage,
+            willPersistForLaterRetry: true,
+          });
+        }
+      });
+    }
+
+    await queue.onIdle();
+>>>>>>> 7767842 (feat: improve batch success/fail logging)
     if (scopedRoots) {
       this.saveScopedFailedBatches(coalesceFailedBatches(failedBatchesForCurrentRun), scopedRoots);
     } else {
       this.saveFailedBatches(coalesceFailedBatches(failedBatchesForCurrentRun));
     }
 
+<<<<<<< HEAD
     this.updateProgress({
+=======
+    if (failedBatchesForCurrentRun.length > 0) {
+      this.logger.embedding("warn", "Persisted failed embedding batches for later retry", {
+        failedBatchCount: coalesceFailedBatches(failedBatchesForCurrentRun).length,
+        failedChunks: stats.failedChunks,
+        failedBatchesPath: this.failedBatchesPath,
+      });
+    }
+
+    onProgress?.({
+>>>>>>> 7767842 (feat: improve batch success/fail logging)
       phase: "storing",
       filesProcessed: files.length,
       totalFiles: files.length,
