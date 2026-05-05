@@ -7,8 +7,11 @@ import { handleEvalCommand } from "./eval/cli.js";
 import { createMcpServer } from "./mcp-server.js";
 import { loadMergedConfig } from "./config/merger.js";
 import { Indexer } from "./indexer/index.js";
-import { formatIndexStats } from "./tools/utils.js";
+import type { IndexProgress } from "./indexer/index.js";
+import { formatIndexStats, formatProgressTitle } from "./tools/utils.js";
 import { formatCostEstimate } from "./utils/cost.js";
+import { initializeLogger } from "./utils/logger.js";
+import { writeProgressLog } from "./utils/progress-log.js";
 
 function parseArgs(argv: string[]): { project: string; config?: string } {
   let project = process.cwd();
@@ -54,7 +57,8 @@ Options:
   --project <path>   Project root directory (default: current directory)
   --force            Clear and rebuild the entire index from scratch
   --estimate-only    Show cost estimate without indexing
-  --verbose          Show detailed info about skipped files and parsing failures
+  --verbose          Show detailed info about skipped files and parsing failures,
+                     plus all internal log entries (info/debug) on the console
   -h, --help         Show this help message`);
     return;
   }
@@ -62,8 +66,53 @@ Options:
   const { project, force, estimateOnly, verbose } = parseIndexArgs(argv);
   const rawConfig = loadMergedConfig(project);
   const config = parseConfig(rawConfig);
-  const indexer = new Indexer(project, config);
 
+  // Echo the resolved config so the user can confirm which settings the run
+  // is actually using (project + global + defaults all merged).
+  console.error(`Project root: ${project}`);
+  console.error("Resolved config:");
+  console.error(JSON.stringify(config, null, 2));
+  console.error("");
+
+  // Wire the global Logger to mirror entries to stderr. CLI runs are
+  // interactive, so warn/error are surfaced by default and --verbose adds
+  // info/debug. We force debug.enabled when verbose so shouldLog() gates
+  // do not silence the very output the flag was meant to enable.
+  if (verbose) {
+    config.debug.enabled = true;
+    config.debug.logLevel = "debug";
+  }
+  const logger = initializeLogger(config.debug);
+  logger.setConsoleOutput(true, verbose ? "debug" : "warn");
+
+  // Resolve progress log path against the project root for relative paths.
+  const rawProgressLogFile = config.debug.progressLogFile;
+  const progressLogFile = rawProgressLogFile
+    ? path.isAbsolute(rawProgressLogFile)
+      ? rawProgressLogFile
+      : path.resolve(project, rawProgressLogFile)
+    : undefined;
+  if (progressLogFile) {
+    console.error(`Progress log: ${progressLogFile}`);
+    console.error("");
+  }
+
+  // De-duplicate identical progress snapshots so we don't spam stderr or the
+  // log file with repeats from the embedding loop.
+  let lastSnapshot = "";
+  const onProgress = (progress: IndexProgress): void => {
+    const snapshot = `${progress.phase}:${progress.filesProcessed}/${progress.totalFiles}:${progress.chunksProcessed}/${progress.totalChunks}:${progress.currentFiles?.join(",") ?? progress.currentFile ?? ""}`;
+    if (snapshot === lastSnapshot) return;
+    lastSnapshot = snapshot;
+
+    const message = formatProgressTitle(progress);
+    console.error(message);
+    if (progressLogFile) {
+      writeProgressLog(progressLogFile, message);
+    }
+  };
+
+  const indexer = new Indexer(project, config);
   await indexer.initialize();
 
   if (estimateOnly) {
@@ -73,16 +122,16 @@ Options:
   }
 
   if (force) {
-    console.log("Clearing existing index...");
+    console.error("Clearing existing index...");
     await indexer.clearIndex();
     const freshIndexer = new Indexer(project, config);
     await freshIndexer.initialize();
-    console.log("Indexing...");
-    const stats = await freshIndexer.index();
+    console.error("Indexing...");
+    const stats = await freshIndexer.index(onProgress);
     console.log(formatIndexStats(stats, verbose));
   } else {
-    console.log("Indexing...");
-    const stats = await indexer.index();
+    console.error("Indexing...");
+    const stats = await indexer.index(onProgress);
     console.log(formatIndexStats(stats, verbose));
   }
 }

@@ -91,6 +91,8 @@ export class Logger {
   private logs: LogEntry[] = [];
   private maxLogs = 1000;
   private clientLog: ClientLogCallback | null = null;
+  private consoleOutput = false;
+  private consoleMinLevel: LogLevel = "warn";
 
   constructor(config: DebugConfig) {
     this.config = config;
@@ -99,6 +101,17 @@ export class Logger {
 
   setClientLogger(fn: ClientLogCallback): void {
     this.clientLog = fn;
+  }
+
+  /**
+   * Mirror log entries to stderr as they are recorded. Used by the CLI so
+   * users can see what the indexer is doing in real time. `minLevel` controls
+   * which entries are printed (e.g. "info" prints info/warn/error, "debug"
+   * prints everything).
+   */
+  setConsoleOutput(enabled: boolean, minLevel: LogLevel = "warn"): void {
+    this.consoleOutput = enabled;
+    this.consoleMinLevel = minLevel;
   }
 
   private shouldLog(level: LogLevel): boolean {
@@ -120,6 +133,14 @@ export class Logger {
     this.logs.push(entry);
     if (this.logs.length > this.maxLogs) {
       this.logs.shift();
+    }
+
+    if (this.consoleOutput && LOG_LEVEL_PRIORITY[level] <= LOG_LEVEL_PRIORITY[this.consoleMinLevel]) {
+      const dataStr = data ? ` ${JSON.stringify(data)}` : "";
+      const line = `[${entry.timestamp}] ${level.toUpperCase()} ${category}: ${message}${dataStr}`;
+      if (level === "error") console.error(line);
+      else if (level === "warn") console.warn(line);
+      else console.error(line); // stderr keeps stdout reserved for command output
     }
   }
 
