@@ -955,6 +955,18 @@ export class PgDatabaseBackend implements IDatabaseBackend {
     return rows.map((r: { file_path: string }) => r.file_path);
   }
 
+  async getFilePathsInRoots(roots: string[]): Promise<string[]> {
+    if (roots.length === 0) return [];
+    const pool = await this.getPool();
+    const conditions = roots.map((_, i) => `file_path LIKE $${i + 1}`).join(" OR ");
+    const params = roots.map((root) => `${root}%`);
+    const { rows } = await pool.query<{ file_path: string }>(
+      `SELECT DISTINCT file_path FROM ${this.t("chunks")} WHERE ${conditions}`,
+      params
+    );
+    return rows.map((r) => r.file_path);
+  }
+
   // ── Branch catalog ────────────────────────────────────────────────
 
   async addChunksToBranch(branch: string, chunkIds: string[]): Promise<void> {

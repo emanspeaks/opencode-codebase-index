@@ -156,6 +156,10 @@ export interface IDatabaseBackend {
    */
   getChunkFilePaths(sourceId?: string): Promise<string[]>;
 
+  /** Return all distinct file paths stored in chunks that fall under at least one of the given root directories. */
+  getFilePathsInRoots(roots: string[]): Promise<string[]>;
+
+
   // ── Branch catalog ───────────────────────────────────────────────
 
   addChunksToBranch(branch: string, chunkIds: string[]): Promise<void>;

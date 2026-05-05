@@ -210,6 +210,12 @@ export class SqliteDatabaseBackend implements IDatabaseBackend {
     return Array.from(this.readFileHashesFromDisk().keys());
   }
 
+  async getFilePathsInRoots(roots: string[]): Promise<string[]> {
+    if (roots.length === 0) return [];
+    const all = Array.from(this.readFileHashesFromDisk().keys());
+    return all.filter((fp) => roots.some((root) => fp.startsWith(root)));
+  }
+
   // ── Branch catalog ───────────────────────────────────────────────
 
   async addChunksToBranch(branch: string, chunkIds: string[]): Promise<void> {

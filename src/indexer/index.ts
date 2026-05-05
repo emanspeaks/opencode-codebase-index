@@ -3390,7 +3390,7 @@ export class Indexer {
               embeddingPartsByChunk.delete(chunkId);
             }
             await database.upsertInvertedIndexChunkBatch(
-              batch.map(c => ({ chunkId: c.id, content: c.content }))
+              pooledResults.map(({ chunk }) => ({ chunkId: chunk.id, content: chunk.content }))
             );
 
             if (pooledResults.length > 0) {
