@@ -120,7 +120,7 @@ export function loadProjectConfigLayer(projectRoot: string): Record<string, unkn
  * - For include/exclude: project overrides global if set, otherwise load global
  */
 export function loadMergedConfig(projectRoot: string): unknown {
-  const globalConfigPath = os.homedir() + "/.config/opencode/codebase-index.json";
+  const globalConfigPath = (process.env["HOME"] ?? process.env["USERPROFILE"] ?? os.homedir()) + "/.config/opencode/codebase-index.json";
   const globalConfig = loadJsonFile(globalConfigPath) as Record<string, unknown> | null;
   const projectConfigPath = resolveProjectConfigPath(projectRoot);
   const projectConfig = loadJsonFile(projectConfigPath) as Record<string, unknown> | null;
