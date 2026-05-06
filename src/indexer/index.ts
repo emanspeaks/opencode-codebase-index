@@ -2780,7 +2780,7 @@ export class Indexer {
     if (chunkDataBatch.length > 0) {
       this.database.upsertChunksBatch(chunkDataBatch);
     }
-    await this.database.addChunksToBranchBatch(this.getBranchCatalogKey(), chunkIds);
+    this.database.addChunksToBranchBatch(this.getBranchCatalogKey(), chunkIds);
   }
 
   private loadIndexMetadata(): IndexMetadata | null {
@@ -2807,25 +2807,25 @@ export class Indexer {
     const existingCreatedAt = this.database.getMetadata("index.createdAt");
     const completeProjectEmbeddingStrategyReset = !this.hasProjectForceReembedPending();
 
-    await this.database.setMetadata("index.version", INDEX_METADATA_VERSION);
-    await this.database.setMetadata("index.embeddingProvider", provider.provider);
-    await this.database.setMetadata("index.embeddingModel", provider.modelInfo.model);
-    await this.database.setMetadata("index.embeddingDimensions", provider.modelInfo.dimensions.toString());
+    this.database.setMetadata("index.version", INDEX_METADATA_VERSION);
+    this.database.setMetadata("index.embeddingProvider", provider.provider);
+    this.database.setMetadata("index.embeddingModel", provider.modelInfo.model);
+    this.database.setMetadata("index.embeddingDimensions", provider.modelInfo.dimensions.toString());
     if (this.config.scope === "global") {
       if (completeProjectEmbeddingStrategyReset) {
-        await this.database.setMetadata(this.getProjectEmbeddingStrategyMetadataKey(), EMBEDDING_STRATEGY_VERSION);
+        this.database.setMetadata(this.getProjectEmbeddingStrategyMetadataKey(), EMBEDDING_STRATEGY_VERSION);
       }
-      await this.database.setMetadata(this.getLegacyMigrationMetadataKey(), "done");
+      this.database.setMetadata(this.getLegacyMigrationMetadataKey(), "done");
       if (completeProjectEmbeddingStrategyReset) {
-        await this.database.deleteMetadata(this.getProjectForceReembedMetadataKey());
+        this.database.deleteMetadata(this.getProjectForceReembedMetadataKey());
       }
     } else {
-      await this.database.setMetadata("index.embeddingStrategyVersion", EMBEDDING_STRATEGY_VERSION);
+      this.database.setMetadata("index.embeddingStrategyVersion", EMBEDDING_STRATEGY_VERSION);
     }
-    await this.database.setMetadata("index.updatedAt", now);
+    this.database.setMetadata("index.updatedAt", now);
 
     if (!existingCreatedAt) {
-      await this.database.setMetadata("index.createdAt", now);
+      this.database.setMetadata("index.createdAt", now);
     }
   }
 
@@ -2886,7 +2886,7 @@ export class Indexer {
         throw new Error('No embedding provider info, you must initialize the indexer first.');
       }
 
-      this.indexCompatibility = await this.validateIndexCompatibility(this.configuredProviderInfo);
+      this.indexCompatibility = this.validateIndexCompatibility(this.configuredProviderInfo);
     }
     return this.indexCompatibility;
   }
@@ -4495,7 +4495,7 @@ export class Indexer {
     }
   ): Promise<SearchResult[]> {
     const { store, provider, database } = await this.ensureInitialized();
-    
+
     const compatibility = this.checkCompatibility();
     if (!compatibility.compatible) {
       throw new Error(
