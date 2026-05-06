@@ -2,12 +2,19 @@ import { existsSync } from "fs";
 import * as os from "os";
 import * as path from "path";
 
-// os.homedir() uses native system calls and ignores process.env overrides on
-// Windows and some Linux configurations.  Read env vars first so that
-// vi.stubEnv("HOME"/"USERPROFILE") works correctly in tests.
+// Prefer env-var overrides so vi.stubEnv("HOME"/"USERPROFILE") works in tests,
+// but validate with existsSync first. On Windows, tools like Git Bash set HOME
+// to a Unix-style path (e.g. /c/Users/foo) that doesn't resolve on the Windows
+// filesystem; os.homedir() handles that case correctly.
 function getHomeDir(): string {
-  return process.env["HOME"] ?? process.env["USERPROFILE"] ?? os.homedir();
+  const fromEnv = process.env["HOME"] ?? process.env["USERPROFILE"];
+  if (fromEnv && existsSync(fromEnv)) {
+    return fromEnv;
+  }
+  return os.homedir();
 }
+
+export { getHomeDir };
 
 import { resolveWorktreeMainRepoRoot } from "../git/index.js";
 

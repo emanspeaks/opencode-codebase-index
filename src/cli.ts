@@ -12,6 +12,7 @@ import { formatIndexStats, formatProgressTitle } from "./tools/utils.js";
 import { formatCostEstimate } from "./utils/cost.js";
 import { initializeLogger } from "./utils/logger.js";
 import { writeProgressLog } from "./utils/progress-log.js";
+import { handleMigrateCommand } from "./migration/sqlite-to-pgvector.js";
 
 function parseArgs(argv: string[]): { project: string; config?: string } {
   let project = process.cwd();
@@ -115,6 +116,20 @@ Options:
   const indexer = new Indexer(project, config);
   await indexer.initialize();
 
+  // Confirm which backend actually connected (helps diagnose SQLite-vs-pgvector confusion).
+  if (config.database.engine === "pgvector" && config.database.pgvector) {
+    const pg = config.database.pgvector;
+    const connDesc = pg.connectionString
+      ? "connection string"
+      : `${pg.user ?? "postgres"}@${pg.host ?? "localhost"}:${pg.port ?? 5432}/${pg.database ?? "postgres"}`;
+    console.error(`Database backend: pgvector (${connDesc})`);
+  } else {
+    const { resolveProjectIndexPath } = await import("./config/paths.js");
+    const dbPath = path.join(resolveProjectIndexPath(project, config.scope), "codebase.db");
+    console.error(`Database backend: sqlite (${dbPath})`);
+  }
+  console.error("");
+
   if (estimateOnly) {
     const estimate = await indexer.estimateCost();
     console.log(formatCostEstimate(estimate));
@@ -144,6 +159,11 @@ async function main(): Promise<void> {
 
   if (process.argv[2] === "index") {
     await handleIndexCommand(process.argv.slice(3));
+    return;
+  }
+
+  if (process.argv[2] === "migrate") {
+    await handleMigrateCommand(process.argv.slice(3));
     return;
   }
 

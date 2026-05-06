@@ -1,8 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import * as os from "os";
 import * as path from "path";
 
-import { resolveProjectConfigPath } from "./paths.js";
+import { getHomeDir, resolveProjectConfigPath } from "./paths.js";
 
 function loadJsonFile(filePath: string): unknown {
   try {
@@ -120,7 +119,7 @@ export function loadProjectConfigLayer(projectRoot: string): Record<string, unkn
  * - For include/exclude: project overrides global if set, otherwise load global
  */
 export function loadMergedConfig(projectRoot: string): unknown {
-  const globalConfigPath = (process.env["HOME"] ?? process.env["USERPROFILE"] ?? os.homedir()) + "/.config/opencode/codebase-index.json";
+  const globalConfigPath = getHomeDir() + "/.config/opencode/codebase-index.json";
   const globalConfig = loadJsonFile(globalConfigPath) as Record<string, unknown> | null;
   const projectConfigPath = resolveProjectConfigPath(projectRoot);
   const projectConfig = loadJsonFile(projectConfigPath) as Record<string, unknown> | null;
