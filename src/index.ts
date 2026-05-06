@@ -170,7 +170,7 @@ const plugin: Plugin = async ({ directory, client }) => {
       setImmediate(() => {
         refreshIndexerFromConfig();
         const bgIndexer = getSharedIndexer();
-        bgIndexer.initialize(client).then(() => {
+        bgIndexer.initialize().then(() => {
           bgIndexer.index().catch(() => {});
         }).catch(() => {});
       });

@@ -3036,26 +3036,26 @@ export class Indexer {
     const existingCreatedAt = await this.database.getMetadata("index.createdAt");
     const completeProjectEmbeddingStrategyReset = !(await this.hasProjectForceReembedPending());
 
-    await this.database.setMetadata("index.version", INDEX_METADATA_VERSION);
-    await this.database.setMetadata("index.embeddingProvider", provider.provider);
-    await this.database.setMetadata("index.embeddingModel", provider.modelInfo.model);
-    await this.database.setMetadata("index.embeddingDimensions", provider.modelInfo.dimensions.toString());
+    this.database.setMetadata("index.version", INDEX_METADATA_VERSION);
+    this.database.setMetadata("index.embeddingProvider", provider.provider);
+    this.database.setMetadata("index.embeddingModel", provider.modelInfo.model);
+    this.database.setMetadata("index.embeddingDimensions", provider.modelInfo.dimensions.toString());
     if (this.config.scope === "global") {
       if (completeProjectEmbeddingStrategyReset) {
-        await this.database.setMetadata(this.getProjectEmbeddingStrategyMetadataKey(), EMBEDDING_STRATEGY_VERSION);
+        this.database.setMetadata(this.getProjectEmbeddingStrategyMetadataKey(), EMBEDDING_STRATEGY_VERSION);
       }
-      await this.database.setMetadata(this.getLegacyMigrationMetadataKey(), "done");
+      this.database.setMetadata(this.getLegacyMigrationMetadataKey(), "done");
       if (completeProjectEmbeddingStrategyReset) {
-        await this.database.deleteMetadata(this.getProjectForceReembedMetadataKey());
+        this.database.deleteMetadata(this.getProjectForceReembedMetadataKey());
       }
       this.branchMigrationDone = true;
     } else {
-      await this.database.setMetadata("index.embeddingStrategyVersion", EMBEDDING_STRATEGY_VERSION);
+      this.database.setMetadata("index.embeddingStrategyVersion", EMBEDDING_STRATEGY_VERSION);
     }
-    await this.database.setMetadata("index.updatedAt", now);
+    this.database.setMetadata("index.updatedAt", now);
 
     if (!existingCreatedAt) {
-      await this.database.setMetadata("index.createdAt", now);
+      this.database.setMetadata("index.createdAt", now);
     }
   }
 
@@ -3112,7 +3112,11 @@ export class Indexer {
 
   checkCompatibility(): IndexCompatibility {
     if (!this.indexCompatibility) {
-      throw new Error('No embedding provider info, you must initialize the indexer first.');
+      if (!this.configuredProviderInfo) {
+        throw new Error('No embedding provider info, you must initialize the indexer first.');
+      }
+
+      this.indexCompatibility = this.validateIndexCompatibility(this.configuredProviderInfo);
     }
     return this.indexCompatibility;
   }
