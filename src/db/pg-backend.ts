@@ -168,9 +168,6 @@ export class PgVectorStoreBackend implements IVectorStoreBackend {
       await client.query("CREATE EXTENSION IF NOT EXISTS vector");
 
       // Create the chunk_vectors table with the correct dimension.
-      // We store the embedding as both a pgvector `vector` column (for ANN
-      // search) and — on the companion PgDatabaseBackend — as raw BYTEA for
-      // fast byte-exact retrieval.  Here we only manage the vector side.
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${this.vectorsTable} (
           chunk_id   TEXT PRIMARY KEY,
