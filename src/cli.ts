@@ -101,7 +101,7 @@ Options:
   // log file with repeats from the embedding loop.
   let lastSnapshot = "";
   const onProgress = (progress: IndexProgress): void => {
-    const snapshot = `${progress.phase}:${progress.filesProcessed}/${progress.totalFiles}:${progress.chunksProcessed}/${progress.totalChunks}:${progress.currentFiles?.join(",") ?? progress.currentFile ?? ""}`;
+    const snapshot = `${progress.phase}:${progress.filesProcessed}/${progress.totalFiles}:${progress.chunksProcessed}/${progress.totalChunks}:${progress.currentFiles?.join(",") ?? ""}`;
     if (snapshot === lastSnapshot) return;
     lastSnapshot = snapshot;
 
