@@ -279,6 +279,7 @@ interface IndexCompatibility {
 const INDEX_METADATA_VERSION = "1";
 const EMBEDDING_STRATEGY_VERSION = "2";
 const RANKING_TOKEN_CACHE_LIMIT = 4096;
+const RANK_HYBRID_CACHE_LIMIT = 256;
 
 function createPendingChunkStorageText(texts: PendingChunk["texts"]): string {
   const primaryText = texts[0]?.text ?? "";
@@ -495,6 +496,7 @@ const rankingQueryTokenCache = new Map<string, Set<string>>();
 const rankingNameTokenCache = new Map<string, Set<string>>();
 const rankingPathTokenCache = new Map<string, Set<string>>();
 const rankingTextTokenCache = new Map<string, Set<string>>();
+const rankHybridResultsCache = new WeakMap<RankedCandidate[], WeakMap<RankedCandidate[], Map<string, RankedCandidate[]>>>();
 
 const STOPWORDS = new Set([
   "the", "and", "for", "with", "from", "that", "this", "into", "using", "where",
@@ -1067,9 +1069,8 @@ export function rerankResults(
   }
 
   const queryTokenList = Array.from(queryTokens);
-  const intent = classifyQueryIntentRaw(query);
   const docIntent = classifyDocIntent(queryTokenList);
-  const preferSourcePaths = options?.prioritizeSourcePaths ?? intent === "source";
+  const preferSourcePaths = options?.prioritizeSourcePaths ?? classifyQueryIntentRaw(query) === "source";
   const identifierHints = extractIdentifierHints(query);
 
   const head = candidates.slice(0, topN).map((candidate, idx) => {
@@ -1271,6 +1272,26 @@ export function rankHybridResults(
   keywordResults: RankedCandidate[],
   options: HybridRankOptions & { prioritizeSourcePaths?: boolean }
 ): RankedCandidate[] {
+  const prioritizeSourcePaths = options.prioritizeSourcePaths ?? classifyQueryIntentRaw(query) === "source";
+  const cacheKey = `${query}\u0001${options.fusionStrategy}|${options.rrfK}|${options.hybridWeight}|${options.rerankTopN}|${options.limit}|${prioritizeSourcePaths ? 1 : 0}`;
+
+  let byKeyword = rankHybridResultsCache.get(semanticResults);
+  if (!byKeyword) {
+    byKeyword = new WeakMap<RankedCandidate[], Map<string, RankedCandidate[]>>();
+    rankHybridResultsCache.set(semanticResults, byKeyword);
+  }
+
+  let bucket = byKeyword.get(keywordResults);
+  if (!bucket) {
+    bucket = new Map<string, RankedCandidate[]>();
+    byKeyword.set(keywordResults, bucket);
+  } else {
+    const cached = bucket.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+  }
+
   const overfetchLimit = Math.max(options.limit * 4, options.limit);
   const fused = options.fusionStrategy === "rrf"
     ? fuseResultsRrf(semanticResults, keywordResults, options.rrfK, overfetchLimit)
@@ -1278,9 +1299,19 @@ export function rankHybridResults(
 
   const rerankPoolLimit = Math.max(overfetchLimit, options.rerankTopN * 3, options.limit * 6);
   const rerankPool = fused.slice(0, rerankPoolLimit);
-  return rerankResults(query, rerankPool, options.rerankTopN, {
-    prioritizeSourcePaths: options.prioritizeSourcePaths ?? classifyQueryIntentRaw(query) === "source",
+  const ranked = rerankResults(query, rerankPool, options.rerankTopN, {
+    prioritizeSourcePaths,
   });
+
+  if (bucket.size >= RANK_HYBRID_CACHE_LIMIT) {
+    const oldest = bucket.keys().next().value;
+    if (oldest !== undefined) {
+      bucket.delete(oldest);
+    }
+  }
+  bucket.set(cacheKey, ranked);
+
+  return ranked;
 }
 
 export function rankSemanticOnlyResults(

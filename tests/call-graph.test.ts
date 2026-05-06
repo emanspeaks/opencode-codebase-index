@@ -536,7 +536,6 @@ const math = @import("math.zig");
       expect(Array.isArray(calls)).toBe(true);
     });
   });
-});
 
   describe("call graph storage", () => {
     it("should store symbols in database", () => {
