@@ -257,7 +257,7 @@ fn is_comment_node(node_type: &str, language: &Language) -> bool {
         Language::Toml => matches!(node_type, "comment"),
         Language::Yaml => matches!(node_type, "comment"),
         Language::Php => matches!(node_type, "comment"),
-        Language::Zig => matches!(node_type, "line_comment" | "doc_comment"),
+        Language::Zig => matches!(node_type, "comment"),
         Language::Apex => matches!(node_type, "line_comment" | "block_comment"),
         _ => false,
     }

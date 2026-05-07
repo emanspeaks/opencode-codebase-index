@@ -526,14 +526,30 @@ pub fn main() void {
       expect(callNames).toContain("greet");
     });
 
-    it("should extract @import builtins", () => {
+    it("should classify field-access calls as MethodCall", () => {
+      const content = `
+const std = @import("std");
+
+pub fn greet(name: []const u8) void {
+    std.debug.print("Hello, {s}\\n", .{name});
+}
+`;
+      const calls = extractCalls(content, "zig");
+      const printCall = calls.find((c) => c.calleeName === "print");
+      expect(printCall).toBeDefined();
+      expect(printCall!.callType).toBe("MethodCall");
+    });
+
+    it("should extract @import builtins as import edges", () => {
       const content = `
 const std = @import("std");
 const math = @import("math.zig");
 `;
       const calls = extractCalls(content, "zig");
-      // calls may be empty if builtin_call node names don't match — just ensure no crash
-      expect(Array.isArray(calls)).toBe(true);
+      const importCalls = calls.filter((c) => c.callType === "Import");
+      expect(importCalls.length).toBeGreaterThanOrEqual(2);
+      expect(importCalls.some((c) => c.calleeName.includes("std"))).toBe(true);
+      expect(importCalls.some((c) => c.calleeName.includes("math.zig"))).toBe(true);
     });
   });
 

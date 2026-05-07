@@ -236,6 +236,7 @@ public class AccountService {
       const content = `
 const std = @import("std");
 
+/// Adds two integers.
 pub fn add(a: i32, b: i32) i32 {
     return a + b;
 }
@@ -250,8 +251,20 @@ test "add works" {
 }
 `;
       const chunks = parseFile("main.zig", content);
-      expect(chunks.length).toBeGreaterThanOrEqual(1);
-      expect(chunks.some((c) => c.content.includes("fn add") || c.content.includes("Point"))).toBe(true);
+
+      // Should produce semantic chunks for each declaration
+      expect(chunks.length).toBeGreaterThanOrEqual(2);
+
+      const chunkTypes = chunks.map((c) => c.chunkType);
+      expect(chunkTypes).toContain("function_declaration");
+      expect(chunkTypes).toContain("test_declaration");
+
+      // Doc comment must be attached to the fn add chunk
+      const addChunk = chunks.find(
+        (c) => c.chunkType === "function_declaration" && c.content.includes("fn add"),
+      );
+      expect(addChunk).toBeDefined();
+      expect(addChunk!.content).toContain("Adds two integers");
     });
   });
 
